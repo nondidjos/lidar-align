@@ -53,6 +53,12 @@ colmap sequential_matcher `
   --FeatureMatching.use_gpu 1
 if (-not $?) { throw "sequential_matcher failed" }
 
+# Estimate focal priors from the view graph (video frames usually lack EXIF focal, so
+# global_mapper otherwise rejects many pairs). Non-fatal if the command is unavailable.
+Write-Host "== view_graph_calibrator (focal priors) =="
+colmap view_graph_calibrator --database_path $db
+if (-not $?) { Write-Host "view_graph_calibrator unavailable/failed - continuing" }
+
 Write-Host "== global_mapper (GLOMAP global SfM, built into COLMAP 4.x) =="
 $sparse = Join-Path $Work "sparse"
 New-Item -ItemType Directory -Force $sparse | Out-Null

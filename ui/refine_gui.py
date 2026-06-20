@@ -49,6 +49,17 @@ CAMERAS = [
 ]
 _CAMERA_MODEL = dict(CAMERAS)
 
+# SfM speed/quality presets -> (feature quality, max features, frames matched ahead).
+# Grounded in COLMAP's own quality tiers: plain GPU SIFT (no affine/DSP) is the norm;
+# DSP-SIFT/affine is the slow CPU "max" path COLMAP reserves for hard cases.
+_SFM_PRESETS = {
+    "Fast (low RAM)":     ("fast", 2048, 5),
+    "Balanced":           ("fast", 4096, 10),
+    "High detail":        ("fast", 8192, 10),
+    "Max quality (slow)": ("high", 8192, 15),
+}
+_SFM_PRESET_NAMES = list(_SFM_PRESETS) + ["Custom"]
+
 _COLMAP_LOCAL_DIR = os.path.join(os.environ.get("APPDATA", ROOT), "lidar-align", "colmap")
 _SETTINGS_FILE = os.path.join(os.environ.get("APPDATA", ROOT), "lidar-align", "gui_settings.json")
 
@@ -269,6 +280,8 @@ class App:
                     self.var[k].set(val)
                 except Exception:
                     pass
+        if "sfm_preset" not in data:   # settings saved before presets -> reset SfM to the sane default
+            self._apply_preset()
 
     def _save_settings(self):
         try:
@@ -520,23 +533,48 @@ class App:
                         "Windows. GLUEMAP: deep-learning hybrid mapper (Linux + CUDA) - install "
                         "gluemap-demo natively or inside WSL2 and the app runs it via 'wsl'. "
                         "GLUEMAP ignores the SIFT quality/keypoint options below.")
-        self._combo(sf, 1, "Feature quality", "sfm_quality", ["high", "fast"], "high",
-                    tip="high: more thorough feature detection (CPU only, slow on many photos, "
-                        "better on blurry video). fast: GPU detection, much faster. (COLMAP/GLOMAP only)")
-        self._spin(sf, 2, "Keypoints per photo", "sfm_max_feats", 1024, 32768, 8192, inc=1024,
-                   tip="How many distinct points to detect per photo for matching. More helps "
-                       "low-texture or sparse scenes; slower. (COLMAP/GLOMAP only)")
-        self._spin(sf, 3, "Frames matched ahead", "sfm_overlap", 1, 50, 10,
+        self._preset_row(sf, 1)
+        self._combo(sf, 2, "Feature quality", "sfm_quality", ["high", "fast"], "fast",
+                    tip="fast: GPU SIFT, much faster - the sane default. high: affine-shape + "
+                        "DSP-SIFT, more matches but CPU-only and very slow on many photos; only "
+                        "for genuinely hard / low-texture sets. (COLMAP/GLOMAP only)")
+        self._spin(sf, 3, "Keypoints per photo", "sfm_max_feats", 1024, 32768, 4096, inc=1024,
+                   tip="Features per photo. More = denser matches + bigger database + more RAM "
+                       "and time in the mapper. 2048-4096 is plenty for high-overlap video; 8192 "
+                       "only for sparse / low-texture sets. (COLMAP/GLOMAP only)")
+        self._spin(sf, 4, "Frames matched ahead", "sfm_overlap", 1, 50, 10,
                    tip="For ordered photos/video: how many neighbouring frames each photo is "
                        "matched against. Higher is more robust to fast motion; slower. (COLMAP/GLOMAP only)")
-        self._path_row(sf, 4, "Loop-closure file (optional)", "sfm_vocab", "", "file",
+        self._path_row(sf, 5, "Loop-closure file (optional)", "sfm_vocab", "", "file",
                        [("Vocab tree", "*.bin"), ("All", "*.*")],
                        tip="Optional COLMAP vocabulary-tree .bin file that lets it recognise when "
                            "the camera revisits the same place (loop closure). (COLMAP/GLOMAP only)")
-        self._path_row(sf, 5, "GLUEMAP config (optional)", "sfm_gluemap_config", "", "file",
+        self._path_row(sf, 6, "GLUEMAP config (optional)", "sfm_gluemap_config", "", "file",
                        [("YAML config", "*.yaml *.yml"), ("All", "*.*")],
                        tip="Optional YAML configuration file for GLUEMAP (e.g. configs/example.yaml). "
                            "If blank, GLUEMAP uses its default settings.")
+
+    def _preset_row(self, parent, row):
+        self._label_with_tip(
+            parent, row, "Speed / quality preset",
+            "A starting point for the SfM knobs below. Fast = small database + low RAM; "
+            "Balanced = the sane default; High detail = 8192 features; Max quality = affine/DSP "
+            "on CPU (very slow). Tweak the knobs after picking, or choose Custom to leave them.")
+        var = tk.StringVar(value="Balanced")
+        self.var["sfm_preset"] = var
+        cb = ttk.Combobox(parent, textvariable=var, state="readonly", width=22,
+                          values=_SFM_PRESET_NAMES)
+        cb.grid(row=row, column=1, sticky="w")
+        cb.bind("<<ComboboxSelected>>", lambda e: self._apply_preset())
+
+    def _apply_preset(self):
+        p = _SFM_PRESETS.get(self.var["sfm_preset"].get())
+        if not p:            # "Custom" -> leave the knobs untouched
+            return
+        q, feats, ov = p
+        self.var["sfm_quality"].set(q)
+        self.var["sfm_max_feats"].set(str(feats))
+        self.var["sfm_overlap"].set(str(ov))
 
     def _toggle_adv(self):
         self._adv_open = not self._adv_open
@@ -760,7 +798,7 @@ class App:
                 "Step 1 needs COLMAP. Click 'Download COLMAP' or install it and add to PATH.")
 
         try:    # Spinbox text is freely editable; don't pass a bad token to COLMAP
-            max_feats = str(int(self.var["sfm_max_feats"].get().strip() or "8192"))
+            max_feats = str(int(self.var["sfm_max_feats"].get().strip() or "4096"))
             overlap = str(int(self.var["sfm_overlap"].get().strip() or "10"))
         except ValueError:
             return messagebox.showerror(
@@ -872,6 +910,17 @@ class App:
                 match += [f"--{vocab_opt}", a["vocab"]]
             if not run(match, "sequential_matcher"):
                 return self.q.put(("done", 1))
+
+            # Estimate focal priors from the view graph. Video frames usually have no EXIF
+            # focal, so COLMAP's default guess is off and global_mapper rejects many pairs with
+            # "relative relation errors". view_graph_calibrator fixes the focals first (the
+            # GLOMAP default). Non-fatal: older COLMAP may lack it.
+            if not run([a["colmap"], "view_graph_calibrator", "--database_path", a["db"]],
+                       "view_graph_calibrator (focal priors)"):
+                if self._cancel.is_set():
+                    return self.q.put(("done", 1))
+                self.q.put(("log", "view_graph_calibrator unavailable/failed - continuing; if "
+                                   "global_mapper rejects many pairs, focal priors are the cause.\n"))
 
             mapper = [a["colmap"], "global_mapper", "--database_path", a["db"],
                       "--image_path", a["images"], "--output_path", a["sparse"]]

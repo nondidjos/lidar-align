@@ -48,6 +48,11 @@ colmap sequential_matcher \
   --SequentialMatching.vocab_tree_path "$VOCAB" \
   --FeatureMatching.use_gpu 1
 
+# Estimate focal priors from the view graph (video frames usually lack EXIF focal, so
+# global_mapper otherwise rejects many pairs). Non-fatal if the command is unavailable.
+echo "== view_graph_calibrator (focal priors) =="
+colmap view_graph_calibrator --database_path "$DB" || echo "view_graph_calibrator unavailable/failed - continuing"
+
 echo "== global_mapper (GLOMAP global SfM, built into COLMAP 4.x) =="
 mkdir -p "$WORK/sparse"
 colmap global_mapper \
