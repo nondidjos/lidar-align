@@ -49,6 +49,7 @@ CAMERAS = [
 _CAMERA_MODEL = dict(CAMERAS)
 
 _COLMAP_LOCAL_DIR = os.path.join(os.environ.get("APPDATA", ROOT), "lidar-align", "colmap")
+_SETTINGS_FILE = os.path.join(os.environ.get("APPDATA", ROOT), "lidar-align", "gui_settings.json")
 
 
 def _ssl_context():
@@ -247,7 +248,31 @@ class App:
         self.var = {}            # key -> tk variable
         self._adv_open = False
         self._build()
+        self._load_settings()
         self.root.after(100, self._drain)
+
+    # ── persist the form across sessions ──────────────────────────────────────
+    def _load_settings(self):
+        try:
+            with open(_SETTINGS_FILE) as f:
+                data = json.load(f)
+        except Exception:
+            return
+        for k, val in data.items():
+            if k in self.var:
+                try:
+                    self.var[k].set(val)
+                except Exception:
+                    pass
+
+    def _save_settings(self):
+        try:
+            os.makedirs(os.path.dirname(_SETTINGS_FILE), exist_ok=True)
+            data = {k: var.get() for k, var in self.var.items()}
+            with open(_SETTINGS_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
 
     # ── small widget builders ────────────────────────────────────────────────
     def _label_with_tip(self, parent, row, text, tip):
@@ -989,6 +1014,7 @@ class App:
 
     def on_close(self):
         self._cancel.set()
+        self._save_settings()
         self.root.destroy()
 
 

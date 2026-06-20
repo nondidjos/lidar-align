@@ -53,6 +53,7 @@ def _make_adjuster(rec, fix_intrinsics, inner_iters):
     opts.print_summary = False
     try:
         opts.ceres.solver_options.max_num_iterations = int(inner_iters)
+        opts.ceres.solver_options.num_threads = max(1, os.cpu_count() or 1)
     except Exception:
         pass  # fall back to pycolmap defaults if the options layout differs
 
