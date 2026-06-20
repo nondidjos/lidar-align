@@ -24,6 +24,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import urllib.request
 import zipfile
@@ -248,6 +249,8 @@ class App:
         self.var = {}            # key -> tk variable
         self._adv_open = False
         self._throb_state = 0
+        self._job_start = None      # wall-clock start of the running job
+        self._last_beat = 0.0       # last heartbeat-to-log time
         self._build()
         self._load_settings()
         self.root.after(100, self._drain)
@@ -959,12 +962,24 @@ class App:
 
     # ── throbber animation ──────────────────────────────────────────────────────────
     def _throb_tick(self):
-        """Update throbber animation while a job is running."""
+        """Spin the throbber, show elapsed time, and heartbeat the log so long quiet steps
+        (e.g. GLOMAP's 'global positioner', which can run for an hour with no output) clearly
+        look alive."""
         if self._worker and self._worker.is_alive():
+            now = time.time()
+            if self._job_start is None:
+                self._job_start = now
+                self._last_beat = now
             self._throb_state = (self._throb_state + 1) % 4
-            frames = "⠋⠙⠹⠸"  # braille spinner frames
-            self.status_throb.config(text=frames[self._throb_state])
+            el = int(now - self._job_start)
+            self.status_throb.config(text="⠋⠙⠹⠸"[self._throb_state])
+            self.status_text.config(text=f"running  {el // 60:d}:{el % 60:02d}")
+            if now - self._last_beat >= 60:     # heartbeat once a minute
+                self._last_beat = now
+                self._append(f"[still working - {el // 60} min elapsed. Long quiet steps like "
+                             "COLMAP/GLOMAP's global positioner are normal on big datasets.]\n")
         else:
+            self._job_start = None
             self.status_throb.config(text="")
         self.root.after(100, self._throb_tick)
 
