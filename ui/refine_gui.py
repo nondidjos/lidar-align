@@ -222,6 +222,20 @@ def _find_gluemap():
     return None, None
 
 
+def _wsl_ready():
+    """True only if WSL has a usable Linux distro. `wsl.exe` ships with Windows even when no
+    distro is installed, so checking for the launcher isn't enough - actually run a no-op."""
+    if not shutil.which("wsl"):
+        return False
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        r = subprocess.run(["wsl", "-e", "true"], capture_output=True, timeout=20,
+                           creationflags=flags)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 class _Tip:
     """Hover tooltip: a small popup shown near the cursor while over `widget`."""
     def __init__(self, widget, text):
@@ -658,7 +672,7 @@ class App:
     def _gluemap_install(self):
         if self._worker and self._worker.is_alive():
             return messagebox.showwarning("Busy", "A job is already running.")
-        if not shutil.which("wsl"):
+        if not _wsl_ready():
             if messagebox.askokcancel(
                     "Install WSL",
                     "WSL isn't installed. I can run 'wsl --install' now - it needs admin (a UAC "
