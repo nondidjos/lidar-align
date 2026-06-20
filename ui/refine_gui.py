@@ -236,6 +236,22 @@ def _wsl_ready():
         return False
 
 
+def _kill_tree(proc):
+    """Kill a subprocess AND its children. colmap can spawn workers, and on Windows
+    Popen.terminate() only kills the parent - so Stop / window-close use taskkill /T to avoid
+    orphaned colmap.exe. Also unblocks a reader stuck on a quiet child's stdout."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            proc.terminate()
+    except Exception:
+        pass
+
+
 class _Tip:
     """Hover tooltip: a small popup shown near the cursor while over `widget`."""
     def __init__(self, widget, text):
@@ -276,6 +292,8 @@ class App:
         self._throb_state = 0
         self._job_start = None      # wall-clock start of the running job
         self._last_beat = 0.0       # last heartbeat-to-log time
+        self._last_output = 0.0     # last time a log line arrived (quiet detection)
+        self._proc = None           # current subprocess, so Stop / close can kill it
         self._build()
         self._load_settings()
         self.root.after(100, self._drain)
@@ -708,12 +726,14 @@ class App:
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, bufsize=1, creationflags=flags)
+            self._proc = proc
             for line in proc.stdout:
                 self.q.put(("log", line))
                 if self._cancel.is_set():
-                    proc.terminate()
+                    _kill_tree(proc)
                     break
             proc.wait()
+            self._proc = None
             self.q.put(("done", proc.returncode))
         except Exception:
             self.q.put(("log", "\n" + traceback.format_exc()))
@@ -835,16 +855,16 @@ class App:
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, bufsize=1, creationflags=flags)
+            self._proc = proc
             for line in proc.stdout:
                 self.q.put(("log", line))
                 if self._cancel.is_set():
-                    proc.terminate()
-                    try:                       # reap it, else it keeps a lock on database.db
-                        proc.wait(timeout=10)
-                    except Exception:
-                        proc.kill()
+                    _kill_tree(proc)        # kills colmap + children, releases the db lock
+                    proc.wait()
+                    self._proc = None
                     return False
             proc.wait()
+            self._proc = None
             if proc.returncode != 0:
                 self.q.put(("log", f"\nERROR: {label} exited {proc.returncode}\n"))
                 return False
@@ -1025,22 +1045,24 @@ class App:
 
     # ── throbber animation ──────────────────────────────────────────────────────────
     def _throb_tick(self):
-        """Spin the throbber, show elapsed time, and heartbeat the log so long quiet steps
-        (e.g. GLOMAP's 'global positioner', which can run for an hour with no output) clearly
-        look alive."""
+        """Spin the throbber and show elapsed time. Only when output has actually gone silent
+        for a while does it heartbeat the log, so the window still looks alive on quiet steps
+        without spamming while a step is printing."""
         if self._worker and self._worker.is_alive():
             now = time.time()
             if self._job_start is None:
                 self._job_start = now
                 self._last_beat = now
+                self._last_output = now
             self._throb_state = (self._throb_state + 1) % 4
             el = int(now - self._job_start)
             self.status_throb.config(text="⠋⠙⠹⠸"[self._throb_state])
             self.status_text.config(text=f"running  {el // 60:d}:{el % 60:02d}")
-            if now - self._last_beat >= 60:     # heartbeat once a minute
+            quiet = now - self._last_output
+            if quiet >= 60 and now - self._last_beat >= 60:   # only when genuinely silent
                 self._last_beat = now
-                self._append(f"[still working - {el // 60} min elapsed. Long quiet steps like "
-                             "COLMAP/GLOMAP's global positioner are normal on big datasets.]\n")
+                self._append(f"[still running — {el // 60}m{el % 60:02d}s elapsed, "
+                             f"no output for {int(quiet)}s]\n")
         else:
             self._job_start = None
             self.status_throb.config(text="")
@@ -1061,7 +1083,8 @@ class App:
     def stop(self):
         if self._worker and self._worker.is_alive():
             self._cancel.set()
-            self._append("\n[cancel requested]\n")
+            _kill_tree(self._proc)   # kill the live subprocess now (don't wait on a blocked read)
+            self._append("\n[stopping…]\n")
             self.stop_btn.config(state="disabled")
 
     def _drain(self):
@@ -1069,6 +1092,7 @@ class App:
             while True:
                 kind, payload = self.q.get_nowait()
                 if kind == "log":
+                    self._last_output = time.time()
                     self._append(payload)
                 elif kind == "colmap_installed":
                     self._colmap_exe = payload
@@ -1109,6 +1133,7 @@ class App:
 
     def on_close(self):
         self._cancel.set()
+        _kill_tree(self._proc)   # don't leave colmap.exe orphaned when the window closes
         self._save_settings()
         self.root.destroy()
 
