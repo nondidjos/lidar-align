@@ -100,6 +100,22 @@ def _spatial_subsample(X, plan, idx, cap):
     return idx[order[first]]
 
 
+def _voxel_pick(X, cap):
+    """Up to ~`cap` point indices, one per voxel (spatially even). Bounds the per-round
+    nearest-plane query: we only need a few thousand well-spread ties, not a k-NN + PCA over
+    every (possibly multi-million) point. No-op when len(X) <= cap."""
+    n = len(X)
+    if cap is None or n <= cap:
+        return np.arange(n)
+    lo = X.min(0)
+    cell = np.maximum(X.max(0) - lo, 1e-9) / max(round(cap ** (1.0 / 3.0)), 1)
+    keys = np.floor((X - lo) / cell).astype(np.int64)
+    keys -= keys.min(0)                                   # non-negative; tiny range (~cap^1/3)
+    packed = (keys[:, 0] << 42) | (keys[:, 1] << 21) | keys[:, 2]   # 1-D key -> fast unique
+    _, first = np.unique(packed, return_index=True)
+    return first
+
+
 def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
                           outer_iters=5, inner_iters=50, max_assoc_dist=0.5,
                           planarity_min=0.1, anneal=True, max_lidar_residuals=30000,
@@ -117,17 +133,35 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
     `prev_err`: previous median error for early stopping comparison (meters).
     """
     prev_med = prev_err if prev_err is not None else float("inf")
+    # Build the bundle adjuster (the reprojection problem over ALL images + points) ONCE and
+    # reuse it every round - rebuilding it per round re-creates millions of residual blocks
+    # outer_iters times. Each round we only swap the (<= cap) LiDAR point-to-plane blocks.
+    ba = _make_adjuster(rec, fix_intrinsics, inner_iters)
+    problem = ba.problem
+    lidar_blocks = []
+    # Cap the per-round nearest-plane query: a few thousand well-spread ties pin the gauge and
+    # warp; querying every point each round is wasted k-NN + PCA work at 7k-image scale.
+    cand_cap = max(8 * max_lidar_residuals, 200_000)
+    _cuda_check_once()
+
     for it in range(outer_iters):
         if cancel_cb is not None and cancel_cb():        # cooperative stop between rounds
             if verbose:
                 print(f"[cancelled before outer {it}]")
             break
+        for bid in lidar_blocks:                          # drop last round's LiDAR ties
+            problem.remove_residual_block(bid)
+        lidar_blocks = []
+
         frac = it / (outer_iters - 1) if (anneal and outer_iters > 1) else 1.0
         assoc = max_assoc_dist * (4.0 ** (1.0 - frac))   # loose -> tight
         w = w_lidar * (0.3 + 0.7 * frac)                  # gentle -> full
         hub = huber * (3.0 ** (1.0 - frac))               # soft -> sharp
 
         ids, X = colmap_io.world_points(rec)
+        ids = np.asarray(ids)
+        cand = _voxel_pick(X, cand_cap)                   # bound the query at scale
+        ids, X = ids[cand], X[cand]
         C, N, dist, plan, nn = planes.query(X)
         # gate: close to the plane AND actually near a scan point (no edge-bleed) AND planar
         keep = (dist < assoc) & (nn < assoc) & (plan > planarity_min)
@@ -155,17 +189,13 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
                 keep_idx = np.flatnonzero((plan > 0.05) & (dist < assoc) & (nn < assoc))
                 sel = _spatial_subsample(X, plan, keep_idx, max_lidar_residuals)
 
-        ba = _make_adjuster(rec, fix_intrinsics, inner_iters)
-        problem = ba.problem
-        # residual is w * n.(X-c); Huber transitions at |r|=arg, so the arg must be
-        # w*hub for the robust threshold to be `hub` METRES of point-to-plane distance
-        # (otherwise it would secretly be hub/w).
+        # residual is w * n.(X-c); Huber transitions at |r|=arg, so the arg must be w*hub for
+        # the robust threshold to be `hub` METRES of point-to-plane distance (else it's hub/w).
         loss = pyceres.HuberLoss(hub * w)
         for k in sel:
-            problem.add_residual_block(
-                PointToPlaneCost(C[k], N[k], w), loss,
-                [rec.points3D[ids[k]].xyz])
-        _cuda_check_once()
+            bid = problem.add_residual_block(
+                PointToPlaneCost(C[k], N[k], w), loss, [rec.points3D[int(ids[k])].xyz])
+            lidar_blocks.append(bid)
         if verbose:
             print(f"[outer {it}] solving…")
         ba.solve()
@@ -176,7 +206,7 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
         if verbose:
             p95 = float(np.percentile(dk, 95)) if len(dk) else float("nan")
             print(f"[outer {it}] residuals {len(sel):,} (of {len(keep_idx):,} gated / "
-                  f"{len(ids):,} pts)  w={w:.1f} huber={hub:.3f} assoc<{assoc:.2f}m  "
+                  f"{len(ids):,} cand)  w={w:.1f} huber={hub:.3f} assoc<{assoc:.2f}m  "
                   f"pt2plane med={med:.3f} p95={p95:.3f} m")
 
         # Early stopping: negligible improvement between rounds -> converged.

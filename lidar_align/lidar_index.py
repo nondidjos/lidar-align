@@ -23,7 +23,15 @@ def _voxel(pts: np.ndarray, voxel: float) -> np.ndarray:
     if not voxel or voxel <= 0 or len(pts) == 0:
         return pts
     keys = np.floor(pts / voxel).astype(np.int64)
-    _, idx = np.unique(keys, axis=0, return_index=True)
+    keys -= keys.min(0)                                    # non-negative
+    span = [int(v) + 1 for v in keys.max(0)]              # per-axis extent (Python ints)
+    # Dedup on a single packed key (one sort) instead of np.unique(axis=0) (row lexsort) when
+    # the mixed-radix code fits in int64; identical first-seen result, much faster at scale.
+    if span[0] * span[1] * span[2] < (1 << 62):
+        packed = (keys[:, 0] * span[1] + keys[:, 1]) * span[2] + keys[:, 2]
+        _, idx = np.unique(packed, return_index=True)
+    else:
+        _, idx = np.unique(keys, axis=0, return_index=True)
     return pts[idx]
 
 
