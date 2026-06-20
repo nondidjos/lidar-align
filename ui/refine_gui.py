@@ -294,6 +294,7 @@ class App:
         self._last_beat = 0.0       # last heartbeat-to-log time
         self._last_output = 0.0     # last time a log line arrived (quiet detection)
         self._proc = None           # current subprocess, so Stop / close can kill it
+        self._chain = None          # (refine_kwargs, images_dir, project): auto-align after Build
         self._build()
         self._load_settings()
         self.root.after(100, self._drain)
@@ -433,9 +434,11 @@ class App:
         # Action bar
         bar = ttk.Frame(top)
         bar.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        self.sfm_btn = ttk.Button(bar, text="▶ 1. Build model (SfM)", command=self.sfm_run)
-        self.sfm_btn.pack(side="left")
-        self.refine_btn = ttk.Button(bar, text="▶ 2. Align to cloud", command=self.refine_run)
+        self.all_btn = ttk.Button(bar, text="▶ Build + Align (all)", command=self.run_all)
+        self.all_btn.pack(side="left")
+        self.sfm_btn = ttk.Button(bar, text="1. Build model", command=self.sfm_run)
+        self.sfm_btn.pack(side="left", padx=(6, 0))
+        self.refine_btn = ttk.Button(bar, text="2. Align to cloud", command=self.refine_run)
         self.refine_btn.pack(side="left", padx=(6, 0))
         self.stop_btn = ttk.Button(bar, text="■ Stop", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(6, 0))
@@ -706,6 +709,7 @@ class App:
             return
         self._cancel.clear()
         self._clear_log()
+        self.all_btn.config(state="disabled")
         self.sfm_btn.config(state="disabled")
         self.refine_btn.config(state="disabled")
         self._gluemap_btn.config(state="disabled", text="Installing GLUEMAP…")
@@ -744,6 +748,7 @@ class App:
             return messagebox.showwarning("Busy", "A job is already running.")
         self._cancel.clear()
         self._colmap_dl_btn.config(state="disabled", text="Downloading…")
+        self.all_btn.config(state="disabled")
         self.sfm_btn.config(state="disabled")
         self.refine_btn.config(state="disabled")
         self._clear_log()
@@ -1013,6 +1018,22 @@ class App:
         )
         return kw, (self._abs(photos) if photos else None)
 
+    def run_all(self):
+        """Build the model, then automatically align to the cloud - one unattended run."""
+        if self._worker and self._worker.is_alive():
+            return messagebox.showwarning("Busy", "A job is already running.")
+        try:
+            kw, images_dir = self._refine_kwargs()       # validate align inputs up front
+        except (ValueError, tk.TclError) as e:
+            return messagebox.showerror("Invalid input", str(e))
+        if not os.path.isfile(kw["lidar"]):
+            return messagebox.showerror("Not found", f"LiDAR file not found:\n{kw['lidar']}")
+        # arm the chain, then run Build; _on_done starts Align automatically if Build succeeds
+        self._chain = (kw, images_dir, self._paths()["project"])
+        self.sfm_run()
+        if not (self._worker and self._worker.is_alive()):
+            self._chain = None       # Build didn't start (bad input) -> don't chain
+
     def refine_run(self):
         if self._worker and self._worker.is_alive():
             return messagebox.showwarning("Busy", "A job is already running.")
@@ -1073,6 +1094,7 @@ class App:
         self._cancel.clear()
         self._clear_log()
         self._append(msg + "\n\n")
+        self.all_btn.config(state="disabled")
         self.sfm_btn.config(state="disabled")
         self.refine_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
@@ -1098,6 +1120,7 @@ class App:
                     self._colmap_exe = payload
                     self._update_colmap_banner()
                     self._colmap_dl_btn.config(state="normal", text="⬇ Download COLMAP")
+                    self.all_btn.config(state="normal")
                     self.sfm_btn.config(state="normal")
                     self.refine_btn.config(state="normal")
                     self._append("\nCOLMAP ready.\n")
@@ -1109,10 +1132,31 @@ class App:
         self.root.after(100, self._drain)
 
     def _on_done(self, code):
+        # Build + Align chain: after Build succeeds, auto-start Align (unattended full run).
+        if code == 0 and self._chain is not None:
+            kw, images_dir, project = self._chain
+            self._chain = None
+            model = self._find_model_dir(project)
+            if self._has_model(model):
+                kw["sparse_in"] = model
+                self._append("\n=== Build done — starting Align to cloud ===\n")
+                self._cancel.clear()
+                self.all_btn.config(state="disabled")
+                self.sfm_btn.config(state="disabled")
+                self.refine_btn.config(state="disabled")
+                self.stop_btn.config(state="normal")
+                self.status_text.config(text="running…")
+                self._worker = threading.Thread(target=self._refine_worker,
+                                                args=(kw, images_dir), daemon=True)
+                self._worker.start()
+                return
+            self._append("\nBuild finished but no camera model was found - skipping align.\n")
+        self._chain = None
         tag = "cancelled" if self._cancel.is_set() else ("done" if code == 0 else f"error ({code})")
         self._append(f"\n─── finished ({tag}) ───\n")
         self.status_text.config(text=tag)
         self.status_throb.config(text="")
+        self.all_btn.config(state="normal")
         self.sfm_btn.config(state="normal")
         self.refine_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
