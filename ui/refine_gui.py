@@ -560,15 +560,42 @@ class App:
                                     foreground="#b00000")
             self._colmap_dl_btn.pack(side="left", padx=(10, 0))
 
+    def _install_wsl(self):
+        """Run `wsl --install` elevated (UAC). Needs a reboot to finish."""
+        if sys.platform != "win32":
+            return messagebox.showerror("Unsupported", "WSL is Windows-only.")
+        try:
+            import ctypes
+            params = ('-NoProfile -ExecutionPolicy Bypass -Command '
+                      '"wsl --install; Read-Host \'WSL install finished - press Enter to close\'"')
+            rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe",
+                                                     params, None, 1)
+            if rc <= 32:
+                return messagebox.showerror(
+                    "Elevation declined",
+                    "Couldn't start the elevated installer (UAC declined). Run 'wsl --install' "
+                    "in an admin PowerShell yourself.")
+            messagebox.showinfo(
+                "Installing WSL",
+                "WSL is installing in the elevated window. When it finishes:\n"
+                "1. Reboot Windows.\n"
+                "2. Open Ubuntu once and set a username/password.\n"
+                "3. Click 'Install GLUEMAP (WSL)' again.")
+        except Exception as e:
+            messagebox.showerror("WSL install failed", str(e))
+
     def _gluemap_install(self):
         if self._worker and self._worker.is_alive():
             return messagebox.showwarning("Busy", "A job is already running.")
         if not shutil.which("wsl"):
-            return messagebox.showerror(
-                "WSL required",
-                "Windows Subsystem for Linux isn't installed.\n\n"
-                "In an admin PowerShell run:  wsl --install\n"
-                "Reboot, then click this again. GLUEMAP also needs an NVIDIA CUDA GPU.")
+            if messagebox.askokcancel(
+                    "Install WSL",
+                    "WSL isn't installed. I can run 'wsl --install' now - it needs admin (a UAC "
+                    "prompt) and a reboot to finish.\n\nAfter rebooting, open Ubuntu once to set a "
+                    "username, then click Install GLUEMAP again. (GLUEMAP also needs an NVIDIA "
+                    "CUDA GPU.)\n\nInstall WSL now?"):
+                self._install_wsl()
+            return
         if not messagebox.askokcancel(
                 "Install GLUEMAP",
                 "This builds GLUEMAP inside WSL and downloads a CUDA PyTorch build plus several "
