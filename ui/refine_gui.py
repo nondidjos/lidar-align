@@ -247,9 +247,11 @@ class App:
         self._colmap_exe = _find_colmap()
         self.var = {}            # key -> tk variable
         self._adv_open = False
+        self._throb_state = 0
         self._build()
         self._load_settings()
         self.root.after(100, self._drain)
+        self.root.after(100, self._throb_tick)  # start throbber animation
 
     # ── persist the form across sessions ──────────────────────────────────────
     def _load_settings(self):
@@ -389,8 +391,11 @@ class App:
         self.refine_btn.pack(side="left", padx=(6, 0))
         self.stop_btn = ttk.Button(bar, text="■ Stop", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(6, 0))
-        self.status = ttk.Label(bar, text="idle")
-        self.status.pack(side="right")
+        # Status: text label + animated throbber
+        self.status_text = ttk.Label(bar, text="idle")
+        self.status_text.pack(side="right", padx=(0, 2))
+        self.status_throb = ttk.Label(bar, text="")
+        self.status_throb.pack(side="right")
 
         # COLMAP status line
         cb = ttk.Frame(top)
@@ -631,7 +636,7 @@ class App:
         self.sfm_btn.config(state="disabled")
         self.refine_btn.config(state="disabled")
         self._gluemap_btn.config(state="disabled", text="Installing GLUEMAP…")
-        self.status.config(text="installing GLUEMAP…")
+        self.status_text.config(text="installing GLUEMAP…")
         self._worker = threading.Thread(target=self._gluemap_install_worker, daemon=True)
         self._worker.start()
 
@@ -952,6 +957,17 @@ class App:
             self.q.put(("log", "\n" + traceback.format_exc()))
             self.q.put(("done", 1))
 
+    # ── throbber animation ──────────────────────────────────────────────────────────
+    def _throb_tick(self):
+        """Update throbber animation while a job is running."""
+        if self._worker and self._worker.is_alive():
+            self._throb_state = (self._throb_state + 1) % 4
+            frames = "⠋⠙⠹⠸"  # braille spinner frames
+            self.status_throb.config(text=frames[self._throb_state])
+        else:
+            self.status_throb.config(text="")
+        self.root.after(100, self._throb_tick)
+
     # ── job lifecycle ────────────────────────────────────────────────────────────
     def _start(self, msg, target, args):
         self._cancel.clear()
@@ -960,7 +976,7 @@ class App:
         self.sfm_btn.config(state="disabled")
         self.refine_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
-        self.status.config(text="running…")
+        self.status_text.config(text="running…")
         self._worker = threading.Thread(target=target, args=args, daemon=True)
         self._worker.start()
 
@@ -993,7 +1009,8 @@ class App:
     def _on_done(self, code):
         tag = "cancelled" if self._cancel.is_set() else ("done" if code == 0 else f"error ({code})")
         self._append(f"\n─── finished ({tag}) ───\n")
-        self.status.config(text=tag)
+        self.status_text.config(text=tag)
+        self.status_throb.config(text="")
         self.sfm_btn.config(state="normal")
         self.refine_btn.config(state="normal")
         self.stop_btn.config(state="disabled")

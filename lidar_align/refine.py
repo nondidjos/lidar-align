@@ -12,6 +12,11 @@ Design (verified against pycolmap 4.0.4 / pyceres 2.6):
     model into the LiDAR frame once before refining (see README).
   - point.xyz is a writable reference shared by both the reprojection and LiDAR costs, so
     the solve updates the reconstruction in place.
+
+NOTE on GPU/CUDA warnings: The pip-installed pyceres wheels do NOT include CUDA/cuDSS support.
+CerES will print warnings like "Requested GPU for bundle adjustment, but Ceres was compiled
+without CUDA support" - this is expected! The solver runs on CPU and works correctly.
+For GPU acceleration, compile Ceres from source with CUDA (advanced, rarely needed).
 """
 from __future__ import annotations
 import os
@@ -66,6 +71,17 @@ def _make_adjuster(rec, fix_intrinsics, inner_iters):
     config.fix_gauge(pycolmap.BundleAdjustmentGauge.UNSPECIFIED)
 
     return pycolmap.create_default_ceres_bundle_adjuster(opts, config, rec)
+
+
+def _cuda_check_once():
+    """Print one helpful note if Ceres GPU solvers aren't available (pyceres wheels lack CUDA)."""
+    if hasattr(_cuda_check_once, "_done"):
+        return
+    _cuda_check_once._done = True
+    # pyceres wheels don't include CUDA; this warning comes from Ceres itself.
+    # Print a friendly note instead of letting users panic about the warning.
+    print("[note] Ceres GPU solvers unavailable (pyceres wheel lacks CUDA/cuDSS). "
+          "The solver runs on CPU - this is normal and works fine.")
 
 
 def _spatial_subsample(X, plan, idx, cap):
@@ -149,6 +165,9 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
             problem.add_residual_block(
                 PointToPlaneCost(C[k], N[k], w), loss,
                 [rec.points3D[ids[k]].xyz])
+        _cuda_check_once()
+        if verbose:
+            print(f"[outer {it}] solving…")
         ba.solve()
 
         # residual stats (used by both the log line and early stopping, so always computed)

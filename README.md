@@ -140,3 +140,7 @@ For a machine with no Python:
 - Rolling shutter isn't modelled. Frames from a moving camera carry skew that hurts the
   solve; culling blurry frames helps but won't fix it.
 - Built against pycolmap 4.0.4 / pyceres 2.6 — re-run the tests if you bump either.
+- **CUDA warning note**: The `pyceres` wheels from PyPI don't include CUDA/cuDSS support.
+  You may see warnings like "Ceres was compiled without CUDA support" in the log — this is
+  expected! The solver runs correctly on CPU. GPU acceleration for Ceres requires
+  compiling it from source with CUDA enabled (rarely needed; the CPU solver is fast).
