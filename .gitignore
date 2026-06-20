@@ -1,0 +1,34 @@
+# Python virtual environment (regenerate: python -m venv .venv && pip install -r requirements.txt)
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build artifacts (regenerate: see README / run_gui.bat for source launch)
+build/
+dist/
+*.spec
+# packaged bundles (distribute via GitHub Releases, not the repo)
+*.zip
+
+# Downloaded third-party — not source (COLMAP binary, colmap-pcd clone)
+vendor/
+
+# Data, scratch, and run outputs
+data/
+.tmp/
+.verify/
+*.ply
+*.las
+*.laz
+*.e57
+*.xmp
+
+# Local config (keep config.example.yaml)
+config.yaml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

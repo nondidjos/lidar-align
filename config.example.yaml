@@ -1,0 +1,36 @@
+# Copy to config.yaml and edit paths.
+
+sparse_in:  data/sfm/sparse/0          # COLMAP/GLOMAP model (poses + sparse cloud)
+sparse_out: data/sfm/sparse_refined    # refined model written here
+lidar:      data/lidar.laz             # RTC360 reference cloud (.las/.laz stream out-of-core)
+
+# Pre-alignment (SfM is only solved up to a similarity -> get it into the LiDAR frame first)
+prealign: true         # run pre-alignment before refining
+prealign_method: auto  # auto (centroid init, ~30deg basin) | global (FPFH, any rotation)
+prealign_voxel: 0.5    # m, downsample used for the coarse pre-align registration
+# correspondences:     # most reliable: exact Umeyama seed, list of [[sx,sy,sz],[lx,ly,lz]] pairs
+
+# Outputs (optional)
+# qa_out: data/qa            # dir for residual_before/after.ply (colour = point-to-plane dist)
+# xmp_out: data/images       # dir for RealityScan .xmp pose sidecars (next to the images)
+xmp_pose_prior: locked       # locked | initial | exact  (how RealityScan treats the poses)
+# xmp_axis_flip: rc_default  # rc_default | identity | flip_xz | flip_xy (if poses look wrong)
+
+# LiDAR reference handling
+voxel: null            # null = raw points within the crop; set e.g. 0.03 (m) to thin
+crop_margin: 2.0       # m, pad around the SfM bounding box when cropping the cloud
+k_plane: 16            # neighbours used to fit each local plane (PCA)
+
+# Refinement
+w_lidar: 5.0           # relative strength of the LiDAR term (higher = scan dominates more)
+huber: 0.1             # m of point-to-plane where the robust kernel engages (decoupled from w_lidar)
+outer_iters: 8         # ICP-style re-association rounds
+inner_iters: 50        # Ceres iterations per round
+max_assoc_dist: 0.5    # m, final association radius for BOTH point-to-plane and nearest-neighbour
+planarity_min: 0.1     # drop non-planar neighbourhoods (lines/edges/clutter now score ~0)
+max_lidar_residuals: 30000  # cap LiDAR ties per round (spatially even) — keeps it fast at scale
+anneal: true           # loose+soft -> tight+sharp schedule across outer_iters
+fix_intrinsics: true   # hold camera calibration fixed (correct pose/structure, not lens)
+
+# Early stopping (optional)
+# early_stop_tol: 0.001  # stop if median pt2plane improvement < this (metres) between rounds
