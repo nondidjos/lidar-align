@@ -170,6 +170,37 @@ def _validate_images_dir(images_dir, sparse_out):
             print(f"    … and {len(missing) - 10} more")
 
 
+def _winpath_to_wsl(p):
+    """C:\\Users\\x -> /mnt/c/Users/x, so a Windows path can be handed to a WSL command."""
+    p = os.path.abspath(p)
+    drive, rest = os.path.splitdrive(p)
+    if drive:
+        return "/mnt/" + drive[0].lower() + rest.replace("\\", "/")
+    return p.replace("\\", "/")
+
+
+def _find_gluemap():
+    """Locate gluemap-demo (Linux+CUDA tool). Returns (mode, exe):
+       ('win', path)  native Windows exe on PATH (rare),
+       ('wsl', name)  found inside WSL -> run as `wsl <name> ...`,
+       (None, None)   not found."""
+    for name in ("gluemap-demo", "gluemap"):
+        p = shutil.which(name)
+        if p:
+            return "win", p
+    if shutil.which("wsl"):
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        for name in ("gluemap-demo", "gluemap"):
+            try:
+                r = subprocess.run(["wsl", "which", name], capture_output=True, text=True,
+                                   timeout=20, creationflags=flags)
+                if r.returncode == 0 and r.stdout.strip():
+                    return "wsl", name
+            except Exception:
+                pass
+    return None, None
+
+
 class _Tip:
     """Hover tooltip: a small popup shown near the cursor while over `widget`."""
     def __init__(self, widget, text):
@@ -441,7 +472,10 @@ class App:
         sf = ttk.Labelframe(parent, text="Photo alignment (SfM, Step 1)", padding=8)
         sf.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=4)
         self._combo(sf, 0, "SfM Engine", "sfm_engine", ["COLMAP/GLOMAP", "GLUEMAP"], "COLMAP/GLOMAP",
-                    tip="COLMAP/GLOMAP: Standard global mapper using SIFT features. GLUEMAP: Deep-learning hybrid mapper (requires separate install of 'gluemap-demo' on your PATH; ignores SIFT quality/keypoint options).")
+                    tip="COLMAP/GLOMAP: standard global mapper using SIFT features; runs on "
+                        "Windows. GLUEMAP: deep-learning hybrid mapper (Linux + CUDA) - install "
+                        "gluemap-demo natively or inside WSL2 and the app runs it via 'wsl'. "
+                        "GLUEMAP ignores the SIFT quality/keypoint options below.")
         self._combo(sf, 1, "Feature quality", "sfm_quality", ["high", "fast"], "high",
                     tip="high: more thorough feature detection (CPU only, slow on many photos, "
                         "better on blurry video). fast: GPU detection, much faster. (COLMAP/GLOMAP only)")
@@ -581,28 +615,24 @@ class App:
         p = self._paths()
 
         if engine == "GLUEMAP":
-            gluemap_exe = shutil.which("gluemap-demo") or shutil.which("gluemap")
+            mode, gluemap_exe = _find_gluemap()
             if not gluemap_exe:
                 return messagebox.showerror(
                     "GLUEMAP not found",
-                    "GLUEMAP executable ('gluemap-demo' or 'gluemap') not found on your PATH.\n"
-                    "Please install GLUEMAP and make sure it is available on the system PATH.")
+                    "gluemap-demo was not found on PATH or inside WSL.\n\n"
+                    "GLUEMAP needs Linux + a CUDA GPU. On Windows, install it inside WSL2 "
+                    "(with the NVIDIA CUDA driver); the app will run it as 'wsl gluemap-demo'.")
             cfg_raw = self.var["sfm_gluemap_config"].get().strip()
-            # Validate optional config file early so the subprocess isn’t launched with a bad path.
+            # Validate the optional config early so we don't launch with a bad path.
             if cfg_raw and not os.path.isfile(self._abs(cfg_raw)):
                 return messagebox.showerror(
-                    "Bad config",
-                    f"GLUEMAP config file not found:\n{cfg_raw}"
-                )
+                    "Bad config", f"GLUEMAP config file not found:\n{cfg_raw}")
             args = dict(
-                engine="GLUEMAP",
-                images=photos,
-                sparse=p["sparse"],
-                project=p["project"],
+                engine="GLUEMAP", mode=mode, gluemap=gluemap_exe,
+                images=photos, sparse=p["sparse"], project=p["project"],
                 config=self._abs(cfg_raw) if cfg_raw else "",
-                gluemap=gluemap_exe,
             )
-            self._start("running SfM (GLUEMAP)…", self._sfm_worker, (args,))
+            self._start(f"running SfM (GLUEMAP via {mode})…", self._sfm_worker, (args,))
             return
 
         self._update_colmap_banner()
@@ -653,11 +683,21 @@ class App:
         try:
             if a.get("engine") == "GLUEMAP":
                 os.makedirs(a["project"], exist_ok=True)   # gluemap won't create --write_path
-                cmd = [a["gluemap"], "--images_path", a["images"],
-                       "--write_path", a["project"], "--intrinsics_mode", "SHARED"]
-                if a.get("config"):
-                    cmd += ["--config", a["config"]]
-                if not run(cmd, "gluemap"):
+                if a.get("mode") == "wsl":
+                    # run inside WSL; translate the Windows paths to /mnt/... . gluemap writes
+                    # to the same on-disk folder (via /mnt/c), so Step 2 reads it on Windows.
+                    cmd = ["wsl", a["gluemap"],
+                           "--images_path", _winpath_to_wsl(a["images"]),
+                           "--write_path", _winpath_to_wsl(a["project"]),
+                           "--intrinsics_mode", "SHARED"]
+                    if a.get("config"):
+                        cmd += ["--config", _winpath_to_wsl(a["config"])]
+                else:
+                    cmd = [a["gluemap"], "--images_path", a["images"],
+                           "--write_path", a["project"], "--intrinsics_mode", "SHARED"]
+                    if a.get("config"):
+                        cmd += ["--config", a["config"]]
+                if not run(cmd, f"gluemap ({a.get('mode')})"):
                     self.q.put(("log", "\nGLUEMAP run failed - see above for details.\n"))
                     return self.q.put(("done", 1))
                 model = self._find_model_dir(a["project"])   # GLUEMAP layout isn't fixed
