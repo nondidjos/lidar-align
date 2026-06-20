@@ -54,7 +54,9 @@ with `scripts/run_sfm.*`, or bring your own from COLMAP / GLOMAP / GLUEMAP.
 > [!TIP]
 > If your photos have low overlap or wide baselines and SIFT matching falls apart, try
 > [GLUEMAP](https://github.com/colmap/gluemap). It writes the same `cameras.bin` /
-> `images.bin` / `points3D.bin`, so lidar-align reads it as-is.
+> `images.bin` / `points3D.bin`, so lidar-align reads it as-is. GLUEMAP needs Linux + an
+> NVIDIA CUDA GPU; on Windows the GUI's **Install GLUEMAP** button builds it inside WSL2 and
+> then runs it through `wsl`. Pick GLUEMAP as the SfM engine once it's installed.
 
 **Reference cloud** — `.las`/`.laz` stream from disk and get cropped to the photo volume as
 they read, so a huge survey never lands in RAM. `.e57` works directly (per-scan poses

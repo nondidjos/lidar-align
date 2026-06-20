@@ -170,6 +170,14 @@ def _validate_images_dir(images_dir, sparse_out):
             print(f"    … and {len(missing) - 10} more")
 
 
+def _resource(rel):
+    """Resolve a repo resource path, working both from source and from a PyInstaller bundle."""
+    parts = rel.split("/")
+    base = getattr(sys, "_MEIPASS", ROOT)
+    p = os.path.join(base, *parts)
+    return p if os.path.exists(p) else os.path.join(ROOT, *parts)
+
+
 def _winpath_to_wsl(p):
     """C:\\Users\\x -> /mnt/c/Users/x, so a Windows path can be handed to a WSL command."""
     p = os.path.abspath(p)
@@ -190,14 +198,14 @@ def _find_gluemap():
             return "win", p
     if shutil.which("wsl"):
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        for name in ("gluemap-demo", "gluemap"):
-            try:
-                r = subprocess.run(["wsl", "which", name], capture_output=True, text=True,
-                                   timeout=20, creationflags=flags)
-                if r.returncode == 0 and r.stdout.strip():
-                    return "wsl", name
-            except Exception:
-                pass
+        try:
+            # login shell so ~/.local/bin (where the installer drops the wrapper) is on PATH
+            r = subprocess.run(["wsl", "bash", "-lc", "command -v gluemap-demo || command -v gluemap"],
+                               capture_output=True, text=True, timeout=25, creationflags=flags)
+            if r.returncode == 0 and r.stdout.strip():
+                return "wsl", "gluemap-demo"
+        except Exception:
+            pass
     return None, None
 
 
@@ -366,6 +374,9 @@ class App:
         self._colmap_lbl.pack(side="left")
         self._colmap_dl_btn = ttk.Button(cb, text="⬇ Download COLMAP",
                                          command=self._colmap_download)
+        self._gluemap_btn = ttk.Button(cb, text="⬇ Install GLUEMAP (WSL)",
+                                       command=self._gluemap_install)
+        self._gluemap_btn.pack(side="right")
         self._update_colmap_banner()
 
         # Log
@@ -549,6 +560,53 @@ class App:
                                     foreground="#b00000")
             self._colmap_dl_btn.pack(side="left", padx=(10, 0))
 
+    def _gluemap_install(self):
+        if self._worker and self._worker.is_alive():
+            return messagebox.showwarning("Busy", "A job is already running.")
+        if not shutil.which("wsl"):
+            return messagebox.showerror(
+                "WSL required",
+                "Windows Subsystem for Linux isn't installed.\n\n"
+                "In an admin PowerShell run:  wsl --install\n"
+                "Reboot, then click this again. GLUEMAP also needs an NVIDIA CUDA GPU.")
+        if not messagebox.askokcancel(
+                "Install GLUEMAP",
+                "This builds GLUEMAP inside WSL and downloads a CUDA PyTorch build plus several "
+                "GB of model weights. It takes a while and needs an NVIDIA GPU.\n\nProceed?"):
+            return
+        self._cancel.clear()
+        self._clear_log()
+        self.sfm_btn.config(state="disabled")
+        self.refine_btn.config(state="disabled")
+        self._gluemap_btn.config(state="disabled", text="Installing GLUEMAP…")
+        self.status.config(text="installing GLUEMAP…")
+        self._worker = threading.Thread(target=self._gluemap_install_worker, daemon=True)
+        self._worker.start()
+
+    def _gluemap_install_worker(self):
+        try:
+            script = _resource("scripts/install_gluemap.sh")
+            if not os.path.isfile(script):
+                self.q.put(("log", f"installer not found: {script}\n"))
+                return self.q.put(("done", 1))
+            wsl_script = _winpath_to_wsl(script)
+            # strip CR (Windows checkout) and run under a WSL login shell
+            cmd = ["wsl", "bash", "-lc", 'tr -d "\\r" < "$1" | bash -ls', "_", wsl_script]
+            self.q.put(("log", f"$ wsl bash {wsl_script}\n\n"))
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1, creationflags=flags)
+            for line in proc.stdout:
+                self.q.put(("log", line))
+                if self._cancel.is_set():
+                    proc.terminate()
+                    break
+            proc.wait()
+            self.q.put(("done", proc.returncode))
+        except Exception:
+            self.q.put(("log", "\n" + traceback.format_exc()))
+            self.q.put(("done", 1))
+
     def _colmap_download(self):
         if self._worker and self._worker.is_alive():
             return messagebox.showwarning("Busy", "A job is already running.")
@@ -684,14 +742,16 @@ class App:
             if a.get("engine") == "GLUEMAP":
                 os.makedirs(a["project"], exist_ok=True)   # gluemap won't create --write_path
                 if a.get("mode") == "wsl":
-                    # run inside WSL; translate the Windows paths to /mnt/... . gluemap writes
-                    # to the same on-disk folder (via /mnt/c), so Step 2 reads it on Windows.
-                    cmd = ["wsl", a["gluemap"],
-                           "--images_path", _winpath_to_wsl(a["images"]),
-                           "--write_path", _winpath_to_wsl(a["project"]),
-                           "--intrinsics_mode", "SHARED"]
+                    # run inside WSL via a login shell (so the ~/.local/bin wrapper is on PATH);
+                    # translate Windows paths to /mnt/... . gluemap writes to the same on-disk
+                    # folder, so Step 2 reads the model back on the Windows side.
+                    inner = ('gluemap-demo --images_path "$1" --write_path "$2" '
+                             '--intrinsics_mode SHARED')
+                    sh_args = ["_", _winpath_to_wsl(a["images"]), _winpath_to_wsl(a["project"])]
                     if a.get("config"):
-                        cmd += ["--config", _winpath_to_wsl(a["config"])]
+                        inner += ' --config "$3"'
+                        sh_args.append(_winpath_to_wsl(a["config"]))
+                    cmd = ["wsl", "bash", "-lc", inner] + sh_args
                 else:
                     cmd = [a["gluemap"], "--images_path", a["images"],
                            "--write_path", a["project"], "--intrinsics_mode", "SHARED"]
@@ -886,6 +946,7 @@ class App:
         self.refine_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self._colmap_dl_btn.config(state="normal", text="⬇ Download COLMAP")
+        self._gluemap_btn.config(state="normal", text="⬇ Install GLUEMAP (WSL)")
         self._worker = None
 
     def _append(self, text):
