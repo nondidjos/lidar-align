@@ -62,6 +62,9 @@ _SFM_PRESET_NAMES = list(_SFM_PRESETS) + ["Custom"]
 
 _COLMAP_LOCAL_DIR = os.path.join(os.environ.get("APPDATA", ROOT), "lidar-align", "colmap")
 _SETTINGS_FILE = os.path.join(os.environ.get("APPDATA", ROOT), "lidar-align", "gui_settings.json")
+# Cap the on-screen log: an unbounded Text widget gets progressively slower to insert into and
+# scroll, which is what makes the window go "Not Responding" on long, chatty runs (6h COLMAP).
+_LOG_MAX_LINES = 5000
 
 
 def _ssl_context():
@@ -1155,13 +1158,17 @@ class App:
             self.stop_btn.config(state="disabled")
 
     def _drain(self):
+        logs = []                                          # batch a tick's log lines -> one insert
         try:
             while True:
                 kind, payload = self.q.get_nowait()
                 if kind == "log":
                     self._last_output = time.time()
-                    self._append(payload)
-                elif kind == "dedup_done":
+                    logs.append(payload)
+                    continue
+                if logs:                                   # flush buffered logs before a state event
+                    self._append("".join(logs)); logs = []
+                if kind == "dedup_done":
                     self.var["lidar"].set(payload)         # repoint the align at the merged copy
                     self._append(f"\nReference cloud set to merged copy:\n{payload}\n")
                 elif kind == "colmap_installed":
@@ -1178,6 +1185,8 @@ class App:
                     self._on_done(payload)
         except queue.Empty:
             pass
+        if logs:                                           # flush the tail of this tick's logs
+            self._append("".join(logs))
         self.root.after(100, self._drain)
 
     def _on_done(self, code):
@@ -1218,6 +1227,11 @@ class App:
     def _append(self, text):
         self.log.configure(state="normal")
         self.log.insert("end", text)
+        # Keep only the last _LOG_MAX_LINES so insert/scroll stay cheap no matter how long the
+        # run logs for. The full COLMAP output still streams; only the on-screen tail is bounded.
+        end_line = int(self.log.index("end-1c").split(".")[0])
+        if end_line > _LOG_MAX_LINES:
+            self.log.delete("1.0", f"{end_line - _LOG_MAX_LINES + 1}.0")
         self.log.see("end")
         self.log.configure(state="disabled")
 
