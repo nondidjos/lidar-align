@@ -34,13 +34,37 @@ _XMP = """<x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:Description xmlns:xcr="http://www.capturingreality.com/ns/xcr/1.1#"
    xcr:Version="3"
    xcr:PosePrior="{prior}"
-   xcr:Coordinates="absolute">
+   xcr:Coordinates="absolute"{calib}>
    <xcr:Rotation>{rot}</xcr:Rotation>
    <xcr:Position>{pos}</xcr:Position>
   </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>
 """
+
+# Calibration-prior attributes (RC convention: focal as 35mm-equiv, principal point offset from
+# centre normalised by image WIDTH, aspect = fy/fx). Written as "initial" so RealityScan seeds
+# from the SfM-solved intrinsics but can still refine them - important for video-extracted frames
+# that have no EXIF focal for RS to fall back on. Distortion is left for RS to estimate (mapping
+# COLMAP's distortion models to RC's is convention-fragile and can't be verified here).
+_CALIB = ('\n   xcr:CalibrationPrior="{cprior}"'
+          '\n   xcr:FocalLength35mm="{f35:.9g}"'
+          '\n   xcr:PrincipalPointU="{ppu:.9g}"'
+          '\n   xcr:PrincipalPointV="{ppv:.9g}"'
+          '\n   xcr:AspectRatio="{ar:.9g}"'
+          '\n   xcr:Skew="0"')
+
+
+def _calib_fields(cam, cprior):
+    """RC calibration-prior attribute string for a pycolmap Camera, or '' if intrinsics
+    look degenerate (then the sidecar is pose-only and RS self-calibrates from EXIF)."""
+    W, H = int(cam.width), int(cam.height)
+    fx, fy = float(cam.focal_length_x), float(cam.focal_length_y)
+    cx, cy = float(cam.principal_point_x), float(cam.principal_point_y)
+    if W <= 0 or H <= 0 or fx <= 0 or fy <= 0:
+        return ""
+    return _CALIB.format(cprior=cprior, f35=fx * 36.0 / W, ppu=(cx - W / 2.0) / W,
+                         ppv=(cy - H / 2.0) / W, ar=fy / fx)
 
 
 def camera_pose(image):
@@ -62,8 +86,14 @@ def _resolve_flip(axis_flip):
     return np.asarray(axis_flip, float)
 
 
-def export_xmp(rec, out_dir, pose_prior="locked", axis_flip=None):
-    """Write one <image_basename>.xmp per registered image. Returns the count."""
+def export_xmp(rec, out_dir, pose_prior="locked", axis_flip=None,
+               include_intrinsics=True, calib_prior="initial"):
+    """Write one <image_basename>.xmp per registered image. Returns the count.
+
+    `include_intrinsics`: also write the SfM-solved focal/principal-point as an RS calibration
+    prior (`calib_prior`, default "initial" = refinable). Strongly recommended for video frames
+    with no EXIF focal, which RS would otherwise have nothing to seed from.
+    """
     F = _resolve_flip(axis_flip)
     os.makedirs(out_dir, exist_ok=True)
     n = 0
@@ -74,11 +104,14 @@ def export_xmp(rec, out_dir, pose_prior="locked", axis_flip=None):
         R_rc = F @ R
         rot = " ".join(f"{v:.15g}" for v in R_rc.reshape(-1))
         pos = " ".join(f"{v:.15g}" for v in C)
+        calib = ""
+        if include_intrinsics and image.camera_id in rec.cameras:
+            calib = _calib_fields(rec.cameras[image.camera_id], calib_prior)
         base = os.path.splitext(image.name)[0]      # may contain a subdir
         target = os.path.join(out_dir, base + ".xmp")
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8") as f:
-            f.write(_XMP.format(prior=pose_prior, rot=rot, pos=pos))
+            f.write(_XMP.format(prior=pose_prior, rot=rot, pos=pos, calib=calib))
         n += 1
     return n
 
