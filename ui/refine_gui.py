@@ -440,6 +440,14 @@ class App:
         self.sfm_btn.pack(side="left", padx=(6, 0))
         self.refine_btn = ttk.Button(bar, text="2. Align to cloud", command=self.refine_run)
         self.refine_btn.pack(side="left", padx=(6, 0))
+        self.dedup_btn = ttk.Button(bar, text="Merge scans", command=self.dedup_run)
+        self.dedup_btn.pack(side="left", padx=(6, 0))
+        _Tip(self.dedup_btn,
+             "One-time prep for big multi-station scans (e.g. an RTC360 .e57 that's huge only "
+             "because every station is stored separately). Merges them into one cloud at the "
+             "Downsample/native spacing (Advanced; defaults to 2 mm), removing redundant overlap "
+             "without losing surface detail. Writes a .dedup.laz next to the source and repoints "
+             "the Reference cloud at it, so later runs load in seconds instead of re-reading the raw file.")
         self.stop_btn = ttk.Button(bar, text="■ Stop", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(6, 0))
         # Status: text label + animated throbber
@@ -1060,6 +1068,42 @@ class App:
                 if images_dir and kwargs.get("xmp_out"):
                     _validate_images_dir(images_dir, kwargs["sparse_out"])
             self.q.put(("done", 0))
+        except KeyboardInterrupt:                          # cooperative Stop during cloud load
+            self.q.put(("log", "\n[cancelled]\n"))
+            self.q.put(("done", 1))
+        except Exception:
+            self.q.put(("log", "\n" + traceback.format_exc()))
+            self.q.put(("done", 1))
+
+    # ── Merge / dedup multi-station cloud ────────────────────────────────────────
+    def dedup_run(self):
+        if self._worker and self._worker.is_alive():
+            return messagebox.showwarning("Busy", "A job is already running.")
+        lidar = self.var["lidar"].get().strip()
+        if not lidar:
+            return messagebox.showerror("Invalid input", "Set the Reference cloud first.")
+        src = self._abs(lidar)
+        if not os.path.isfile(src):
+            return messagebox.showerror("Not found", f"Cloud file not found:\n{src}")
+        voxel = self.var["voxel"].get().strip()
+        try:
+            vx = float(voxel) if voxel else 0.002          # default native ~2 mm spacing
+        except ValueError:
+            return messagebox.showerror("Invalid input", f"Downsample (m) is not a number: {voxel!r}")
+        self._start(f"merging scan stations in {os.path.basename(src)} at {vx:g} m "
+                    f"(removes station overlap, keeps detail; Stop is safe)…",
+                    self._dedup_worker, (src, vx))
+
+    def _dedup_worker(self, src, vx):
+        try:
+            from lidar_align.lidar_index import dedup_to_laz
+            with contextlib.redirect_stdout(_QueueWriter(self.q)):
+                dst, _ = dedup_to_laz(src, voxel=vx, cancel_cb=self._cancel.is_set)
+            self.q.put(("dedup_done", dst))
+            self.q.put(("done", 0))
+        except KeyboardInterrupt:
+            self.q.put(("log", "\n[cancelled - no file written]\n"))
+            self.q.put(("done", 1))
         except Exception:
             self.q.put(("log", "\n" + traceback.format_exc()))
             self.q.put(("done", 1))
@@ -1097,6 +1141,7 @@ class App:
         self.all_btn.config(state="disabled")
         self.sfm_btn.config(state="disabled")
         self.refine_btn.config(state="disabled")
+        self.dedup_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.status_text.config(text="running…")
         self._worker = threading.Thread(target=target, args=args, daemon=True)
@@ -1116,6 +1161,9 @@ class App:
                 if kind == "log":
                     self._last_output = time.time()
                     self._append(payload)
+                elif kind == "dedup_done":
+                    self.var["lidar"].set(payload)         # repoint the align at the merged copy
+                    self._append(f"\nReference cloud set to merged copy:\n{payload}\n")
                 elif kind == "colmap_installed":
                     self._colmap_exe = payload
                     self._update_colmap_banner()
@@ -1123,6 +1171,7 @@ class App:
                     self.all_btn.config(state="normal")
                     self.sfm_btn.config(state="normal")
                     self.refine_btn.config(state="normal")
+                    self.dedup_btn.config(state="normal")
                     self._append("\nCOLMAP ready.\n")
                     self._worker = None
                 else:
@@ -1144,6 +1193,7 @@ class App:
                 self.all_btn.config(state="disabled")
                 self.sfm_btn.config(state="disabled")
                 self.refine_btn.config(state="disabled")
+                self.dedup_btn.config(state="disabled")
                 self.stop_btn.config(state="normal")
                 self.status_text.config(text="running…")
                 self._worker = threading.Thread(target=self._refine_worker,
@@ -1159,6 +1209,7 @@ class App:
         self.all_btn.config(state="normal")
         self.sfm_btn.config(state="normal")
         self.refine_btn.config(state="normal")
+        self.dedup_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self._colmap_dl_btn.config(state="normal", text="⬇ Download COLMAP")
         self._gluemap_btn.config(state="normal", text="⬇ Install GLUEMAP (WSL)")

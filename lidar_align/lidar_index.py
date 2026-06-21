@@ -35,9 +35,14 @@ def _voxel(pts: np.ndarray, voxel: float) -> np.ndarray:
     return pts[idx]
 
 
-def _load_points(path, voxel=None, crop_aabb=None, crop_margin=0.0, max_points=None):
+def _load_points(path, voxel=None, crop_aabb=None, crop_margin=0.0, max_points=None,
+                 log=None, cancel_cb=None):
     path = str(path)
     ext = os.path.splitext(path)[1].lower()
+    _log = log or (lambda *a: None)                       # progress sink (GUI/stdout) or no-op
+    def _stop():                                          # cooperative cancel between chunks/scans
+        if cancel_cb is not None and cancel_cb():
+            raise KeyboardInterrupt("cancelled while reading cloud")
     lo = hi = None
     if crop_aabb is not None:
         lo = np.asarray(crop_aabb[0], np.float64) - crop_margin
@@ -46,8 +51,10 @@ def _load_points(path, voxel=None, crop_aabb=None, crop_margin=0.0, max_points=N
     if ext in (".las", ".laz"):
         import laspy
         kept = []
+        kept_n = 0
         with laspy.open(path) as f:
-            for chunk in f.chunk_iterator(5_000_000):
+            for ci, chunk in enumerate(f.chunk_iterator(5_000_000)):
+                _stop()
                 xyz = np.column_stack([chunk.x, chunk.y, chunk.z]).astype(np.float64)
                 if lo is not None:
                     m = np.all((xyz >= lo) & (xyz <= hi), axis=1)
@@ -56,6 +63,8 @@ def _load_points(path, voxel=None, crop_aabb=None, crop_margin=0.0, max_points=N
                     xyz = _voxel(xyz, voxel)
                 if len(xyz):
                     kept.append(xyz)
+                    kept_n += len(xyz)
+                _log(f"  chunk {ci + 1}: {kept_n:,} pts kept\n")
         pts = np.concatenate(kept) if kept else np.empty((0, 3))
         pts = _voxel(pts, voxel)  # merge per-chunk voxel overlaps
     elif ext == ".e57":
@@ -65,8 +74,11 @@ def _load_points(path, voxel=None, crop_aabb=None, crop_margin=0.0, max_points=N
         # as the LAS path, so only the LiDAR near your photos is held in memory.
         import pye57
         e = pye57.E57(path)
+        nscan = e.scan_count
         kept = []
-        for i in range(e.scan_count):
+        kept_n = 0
+        for i in range(nscan):
+            _stop()
             d = e.read_scan(i, transform=True, ignore_missing_fields=True)
             try:
                 xyz = np.column_stack([d["cartesianX"], d["cartesianY"], d["cartesianZ"]])
@@ -83,6 +95,8 @@ def _load_points(path, voxel=None, crop_aabb=None, crop_margin=0.0, max_points=N
                 xyz = _voxel(xyz, voxel)
             if len(xyz):
                 kept.append(xyz)
+                kept_n += len(xyz)
+            _log(f"  scan {i + 1}/{nscan}: {kept_n:,} pts kept\n")
         pts = np.concatenate(kept) if kept else np.empty((0, 3))
         pts = _voxel(pts, voxel)                          # merge per-scan voxel overlaps
     else:
@@ -98,6 +112,38 @@ def _load_points(path, voxel=None, crop_aabb=None, crop_margin=0.0, max_points=N
         sel = np.random.default_rng(0).choice(len(pts), max_points, replace=False)
         pts = pts[sel]
     return np.ascontiguousarray(pts, np.float64)
+
+
+def dedup_to_laz(src, voxel, dst=None, log=None, cancel_cb=None):
+    """Merge a (possibly multi-station) cloud and write ONE LAZ next to the source.
+
+    Survey e57s are often enormous only because each scan station is stored separately, so
+    every surface is recorded many times over. Voxel-merging at the cloud's NATIVE point
+    spacing collapses that redundant overlap, not real surface detail - the result is
+    full-resolution but a fraction of the size, and later runs load it in seconds instead of
+    re-reading the raw file. Output goes beside the source so it can't bloat an unknown folder.
+    Returns (output_path, point_count).
+    """
+    import laspy
+    src = str(src)
+    if not voxel or voxel <= 0:
+        raise ValueError("dedup needs a positive voxel - use the cloud's native point "
+                         "spacing (e.g. 0.002 for 2 mm), not a coarse downsample")
+    if dst is None:
+        dst = os.path.splitext(src)[0] + f".dedup{voxel:g}.laz"   # same dir as the source
+    _log = log or (lambda *a: None)
+    _log(f"reading + merging {src}\n")
+    pts = _load_points(src, voxel=voxel, log=log, cancel_cb=cancel_cb)
+    if len(pts) == 0:
+        raise ValueError(f"{src}: no points after read/dedup")
+    header = laspy.LasHeader(point_format=3, version="1.4")
+    header.scales = [0.001, 0.001, 0.001]                 # 1 mm, survey grade
+    header.offsets = np.floor(pts.min(axis=0))            # keep scaled ints in range
+    las = laspy.LasData(header)
+    las.x, las.y, las.z = pts[:, 0], pts[:, 1], pts[:, 2]
+    las.write(dst)
+    _log(f"wrote {len(pts):,} merged pts -> {dst}\n")
+    return dst, len(pts)
 
 
 def _fit_planes(neigh: np.ndarray):
@@ -128,9 +174,11 @@ class LidarPlanes:
 
     @classmethod
     def from_file(cls, path, voxel=None, crop_aabb=None, crop_margin=2.0,
-                  k_plane=16, max_points=None):
+                  k_plane=16, max_points=None, log=None, cancel_cb=None):
         pts = _load_points(path, voxel=voxel, crop_aabb=crop_aabb,
-                            crop_margin=crop_margin, max_points=max_points)
+                           crop_margin=crop_margin, max_points=max_points,
+                           log=log, cancel_cb=cancel_cb)
+        (log or (lambda *a: None))(f"building KD-tree over {len(pts):,} points…\n")
         return cls(pts, k_plane=k_plane)
 
     def query(self, X: np.ndarray, k_plane=None, batch=200_000):

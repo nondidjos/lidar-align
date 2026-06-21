@@ -15,15 +15,23 @@ want a reusable, pre-thinned LAZ instead of re-reading the raw e57 every run.
 Needs: pip install pye57 laspy[lazrs]   (both in requirements.txt)
 """
 import argparse
+import os
 import numpy as np
 
 
 def _voxel(pts, voxel):
-    """Keep one point per voxel (first seen)."""
+    """Keep one point per voxel (first seen). Dedup on one packed key (a single sort) instead
+    of np.unique(axis=0)'s row lexsort - same result, far faster on survey-scale clouds."""
     if not voxel or len(pts) == 0:
         return pts
     keys = np.floor(pts / voxel).astype(np.int64)
-    _, idx = np.unique(keys, axis=0, return_index=True)
+    keys -= keys.min(0)
+    span = [int(v) + 1 for v in keys.max(0)]
+    if span[0] * span[1] * span[2] < (1 << 62):
+        packed = (keys[:, 0] * span[1] + keys[:, 1]) * span[2] + keys[:, 2]
+        _, idx = np.unique(packed, return_index=True)
+    else:
+        _, idx = np.unique(keys, axis=0, return_index=True)
     return pts[idx]
 
 
@@ -68,11 +76,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", help="input .e57")
-    ap.add_argument("output", help="output .las or .laz")
+    ap.add_argument("output", nargs="?", default=None,
+                    help="output .las or .laz (default: <input>.dedup.laz, next to the input)")
     ap.add_argument("--voxel", type=float, default=None,
-                    help="downsample to one point per VOXEL metres (e.g. 0.03)")
+                    help="merge to one point per VOXEL metres (use native spacing, e.g. 0.002, "
+                         "to drop station overlap without losing detail)")
     args = ap.parse_args()
-    convert(args.input, args.output, voxel=args.voxel)
+    out = args.output or (os.path.splitext(args.input)[0] + ".dedup.laz")
+    convert(args.input, out, voxel=args.voxel)
 
 
 if __name__ == "__main__":

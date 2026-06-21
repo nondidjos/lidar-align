@@ -239,7 +239,9 @@ def refine(sparse_in, lidar, sparse_out,
 
     if prealign:
         from .prealign import prealign_reconstruction
-        coarse = _load_points(lidar, voxel=prealign_voxel)
+        print(f"pre-align: loading coarse cloud ({prealign_voxel} m voxel)…")
+        coarse = _load_points(lidar, voxel=prealign_voxel,
+                              log=(print if verbose else None), cancel_cb=cancel_cb)
         info = prealign_reconstruction(rec, coarse, correspondences=correspondences,
                                        method=prealign_method, voxel=prealign_voxel)
         print(f"prealign[{prealign_method}]: scale={info['scale']:.4f} "
@@ -251,8 +253,12 @@ def refine(sparse_in, lidar, sparse_out,
           f"-> metric params (assoc/crop in same units)")
 
     if planes is None:
+        # This load + voxel + KD-tree build is the longest silent stage on a big raw cloud;
+        # stream progress and honour Stop so it isn't a multi-hour black hole.
+        print("building plane index: loading cloud, voxel-merging, KD-tree…")
         planes = LidarPlanes.from_file(lidar, voxel=voxel, crop_aabb=(lo, hi),
-                                       crop_margin=crop_margin, k_plane=k_plane)
+                                       crop_margin=crop_margin, k_plane=k_plane,
+                                       log=(print if verbose else None), cancel_cb=cancel_cb)
     print(f"lidar index: {planes.pts.shape[0]:,} points (cropped to SfM volume)")
 
     # foot-gun: the nearest-neighbour gate needs assoc > LiDAR point spacing, else every
