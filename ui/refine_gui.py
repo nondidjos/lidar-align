@@ -464,6 +464,13 @@ class App:
         self.sfm_btn.pack(side="left", padx=(6, 0))
         self.refine_btn = ttk.Button(bar, text="2. Align to cloud", command=self.refine_run)
         self.refine_btn.pack(side="left", padx=(6, 0))
+        self.xmp_btn = ttk.Button(bar, text="↻ Re-export XMP", command=self.reexport_xmp_run)
+        self.xmp_btn.pack(side="left", padx=(6, 0))
+        _Tip(self.xmp_btn,
+             "Regenerate the RealityScan .xmp poses from the already-aligned model (no re-align). "
+             "Use this to try a different Axis convention in seconds when the cameras import "
+             "mirrored or upside-down: change 'Axis convention' under Advanced, click this, re-import "
+             "one image in RealityScan, repeat until it looks right.")
         self.dedup_btn = ttk.Button(bar, text="Merge scans", command=self.dedup_run)
         self.dedup_btn.pack(side="left", padx=(6, 0))
         _Tip(self.dedup_btn,
@@ -1146,6 +1153,44 @@ class App:
             self.q.put(("log", "\n" + traceback.format_exc()))
             self.q.put(("done", 1))
 
+    # ── Re-export XMP poses from the already-aligned model (no re-align) ──────────
+    def reexport_xmp_run(self):
+        if self._worker and self._worker.is_alive():
+            return messagebox.showwarning("Busy", "A job is already running.")
+        v = self.var
+        model = self._paths()["sparse_out"]            # the refined model the align saved
+        if not self._has_model(model):
+            return messagebox.showerror(
+                "No aligned model",
+                f"No refined model at:\n{model}\n\nRun Align first - this re-exports its poses.")
+        photos = v["photos"].get().strip()
+        xmp_dir = v["xmp_dir"].get().strip()
+        if xmp_dir:
+            xmp_out = self._abs(xmp_dir)
+        elif bool(v["xmp_next"].get()) and photos:
+            xmp_out = self._abs(photos)
+        else:
+            return messagebox.showerror(
+                "No XMP target",
+                "Set a Photos folder with 'Write XMP next to photos', or an XMP folder.")
+        axis = v["xmp_axis_flip"].get().strip() or None
+        self._start(f"re-exporting XMP (axis={axis or 'rc_default'}) from the aligned model…",
+                    self._reexport_worker, (model, xmp_out, v["xmp_pose_prior"].get(), axis))
+
+    def _reexport_worker(self, model, xmp_out, prior, axis):
+        try:
+            from lidar_align import colmap_io
+            from lidar_align.export_xmp import export_xmp
+            with contextlib.redirect_stdout(_QueueWriter(self.q)):
+                rec = colmap_io.load(model)
+                n = export_xmp(rec, xmp_out, pose_prior=prior, axis_flip=axis)
+                print(f"re-exported {n} RealityScan .xmp sidecars "
+                      f"(axis={axis or 'rc_default'}) -> {xmp_out}")
+            self.q.put(("done", 0))
+        except Exception:
+            self.q.put(("log", "\n" + traceback.format_exc()))
+            self.q.put(("done", 1))
+
     # ── throbber animation ──────────────────────────────────────────────────────────
     def _throb_tick(self):
         """Spin the throbber and show elapsed time. Only when output has actually gone silent
@@ -1181,6 +1226,7 @@ class App:
         self.sfm_btn.config(state="disabled")
         self.refine_btn.config(state="disabled")
         self.dedup_btn.config(state="disabled")
+        self.xmp_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.status_text.config(text="running…")
         self._worker = threading.Thread(target=target, args=args, daemon=True)
@@ -1218,6 +1264,7 @@ class App:
                     self.sfm_btn.config(state="normal")
                     self.refine_btn.config(state="normal")
                     self.dedup_btn.config(state="normal")
+                    self.xmp_btn.config(state="normal")
                     self._append("\nCOLMAP ready.\n")
                     self._worker = None
                 else:
@@ -1242,6 +1289,7 @@ class App:
                 self.sfm_btn.config(state="disabled")
                 self.refine_btn.config(state="disabled")
                 self.dedup_btn.config(state="disabled")
+                self.xmp_btn.config(state="disabled")
                 self.stop_btn.config(state="normal")
                 self.status_text.config(text="running…")
                 self._worker = threading.Thread(target=self._refine_worker,
@@ -1258,6 +1306,7 @@ class App:
         self.sfm_btn.config(state="normal")
         self.refine_btn.config(state="normal")
         self.dedup_btn.config(state="normal")
+        self.xmp_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
         self._colmap_dl_btn.config(state="normal", text="⬇ Download COLMAP")
         self._gluemap_btn.config(state="normal", text="⬇ Install GLUEMAP (WSL)")
