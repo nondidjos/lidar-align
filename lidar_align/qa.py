@@ -35,10 +35,19 @@ def write_ply(path, points, colors):
         f.write(arr.tobytes())
 
 
-def residual_ply(rec, planes, path, dmax=None):
-    """Write a residual-coloured PLY of the reconstruction's points; return (dist, dmax)."""
-    from . import colmap_io
-    _, X = colmap_io.world_points(rec)
+def residual_ply(rec, planes, path, dmax=None, max_points=2_000_000):
+    """Write a residual-coloured PLY of the reconstruction's points; return (dist, dmax).
+
+    Caps to `max_points` (deterministic subsample) so the QA plane-query and PLY write stay
+    bounded on multi-million-point models - this is visual evidence of the warp, not a
+    deliverable, and a couple million points show the flattening just as well. The fixed seed
+    and stable point order make the before/after PLYs sample the same points for comparison.
+    """
+    objs = list(rec.points3D.values())
+    if max_points and len(objs) > max_points:
+        sel = np.sort(np.random.default_rng(0).choice(len(objs), max_points, replace=False))
+        objs = [objs[i] for i in sel]
+    X = np.array([p.xyz for p in objs], np.float64)
     _, _, dist, _, _ = planes.query(X)
     if dmax is None:
         dmax = float(np.percentile(dist, 95)) or 1.0

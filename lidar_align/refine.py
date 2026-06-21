@@ -96,7 +96,13 @@ def _spatial_subsample(X, plan, idx, cap):
     cell = np.maximum(pts.max(0) - lo, 1e-9) / max(round(cap ** (1.0 / 3.0)), 1)
     keys = np.floor((pts - lo) / cell).astype(np.int64)
     order = np.argsort(-plan[idx])              # most-planar first
-    _, first = np.unique(keys[order], axis=0, return_index=True)
+    ki = keys[order]
+    span = [int(v) + 1 for v in ki.max(0)]     # keys are >= 0 already (shifted by lo)
+    if span[0] * span[1] * span[2] < (1 << 62):   # one packed key -> one sort, not a row lexsort
+        packed = (ki[:, 0] * span[1] + ki[:, 1]) * span[2] + ki[:, 2]
+        _, first = np.unique(packed, return_index=True)
+    else:
+        _, first = np.unique(ki, axis=0, return_index=True)
     return idx[order[first]]
 
 
@@ -144,6 +150,19 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
     cand_cap = max(8 * max_lidar_residuals, 200_000)
     _cuda_check_once()
 
+    # Reading every point's coordinates each round (world_points over millions of points) costs
+    # ~24 s/round at 7k-image scale and we keep only ~cand_cap of them. Instead read all points
+    # ONCE to choose a spatially-even candidate set, keep the live Point3D handles, and each
+    # round read just that set's CURRENT coordinates. cand_pts[k].xyz stays a writable reference
+    # the solve mutates in place, exactly like rec.points3D[id].xyz. For sets <= cand_cap the
+    # candidate set is every point, so behaviour is identical to the per-round full read.
+    all_objs = list(rec.points3D.values())
+    X_all = np.array([p.xyz for p in all_objs], np.float64)
+    cand = _voxel_pick(X_all, cand_cap)
+    cand_pts = [all_objs[k] for k in cand]
+    n_cand = len(cand_pts)
+    del all_objs, X_all
+
     for it in range(outer_iters):
         if cancel_cb is not None and cancel_cb():        # cooperative stop between rounds
             if verbose:
@@ -158,10 +177,7 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
         w = w_lidar * (0.3 + 0.7 * frac)                  # gentle -> full
         hub = huber * (3.0 ** (1.0 - frac))               # soft -> sharp
 
-        ids, X = colmap_io.world_points(rec)
-        ids = np.asarray(ids)
-        cand = _voxel_pick(X, cand_cap)                   # bound the query at scale
-        ids, X = ids[cand], X[cand]
+        X = np.array([p.xyz for p in cand_pts], np.float64)   # current coords of the candidate set
         C, N, dist, plan, nn = planes.query(X)
         # gate: close to the plane AND actually near a scan point (no edge-bleed) AND planar
         keep = (dist < assoc) & (nn < assoc) & (plan > planarity_min)
@@ -194,7 +210,7 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
         loss = pyceres.HuberLoss(hub * w)
         for k in sel:
             bid = problem.add_residual_block(
-                PointToPlaneCost(C[k], N[k], w), loss, [rec.points3D[int(ids[k])].xyz])
+                PointToPlaneCost(C[k], N[k], w), loss, [cand_pts[k].xyz])
             lidar_blocks.append(bid)
         if verbose:
             print(f"[outer {it}] solving…")
@@ -206,7 +222,7 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
         if verbose:
             p95 = float(np.percentile(dk, 95)) if len(dk) else float("nan")
             print(f"[outer {it}] residuals {len(sel):,} (of {len(keep_idx):,} gated / "
-                  f"{len(ids):,} cand)  w={w:.1f} huber={hub:.3f} assoc<{assoc:.2f}m  "
+                  f"{n_cand:,} cand)  w={w:.1f} huber={hub:.3f} assoc<{assoc:.2f}m  "
                   f"pt2plane med={med:.3f} p95={p95:.3f} m")
 
         # Early stopping: negligible improvement between rounds -> converged.
@@ -220,7 +236,7 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
 
 
 def _sfm_aabb(rec):
-    P = np.array([rec.points3D[p].xyz for p in rec.points3D], np.float64)
+    P = np.array([p.xyz for p in rec.points3D.values()], np.float64)   # .values() avoids re-lookup
     return P.min(0), P.max(0)
 
 
