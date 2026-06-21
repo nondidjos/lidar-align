@@ -1405,6 +1405,15 @@ def _selftest():
         from lidar_align.refine import _rss_gb        # the [stage] RAM probe must work frozen
         assert _rss_gb() > 0, "rss probe returned no value"
 
+        # The whole GUI must actually construct in the frozen bundle. --selftest never reaches
+        # mainloop, so without this a wiring error in _build() would ship as an app that opens to
+        # nothing. Build it headless (withdrawn) and tear it down.
+        _root = tk.Tk(); _root.withdraw()
+        try:
+            App(_root)
+        finally:
+            _root.destroy()
+
         print("SELFTEST OK"); _mark("OK"); return 0
     except Exception:
         tb = traceback.format_exc(); traceback.print_exc(); _mark("FAIL\n" + tb); return 1
