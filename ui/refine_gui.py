@@ -1322,8 +1322,33 @@ def _selftest():
         si = os.path.join(work, "si"); os.makedirs(si); rec.write(si)
         refine(sparse_in=si, lidar=os.path.join(work, "l.las"),
                sparse_out=os.path.join(work, "so"), prealign=False,
-               outer_iters=4, inner_iters=20)
+               xmp_out=os.path.join(work, "xmp"), outer_iters=4, inner_iters=20)
         assert os.path.exists(os.path.join(work, "so", "points3D.bin")), "no refined model"
+        assert any(f.endswith(".xmp") for f in os.listdir(os.path.join(work, "xmp"))), "no xmp"
+
+        # e57 chunked reader (the OOM fix for big multi-station scans) - exercise it frozen,
+        # forcing several read() blocks per scan with a tiny chunk size so the lower-level
+        # pye57 buffer/reader path is actually verified in the bundle, not just in the venv.
+        import pye57
+        import lidar_align.lidar_index as _li
+        from lidar_align.lidar_index import _load_points
+        ep = os.path.join(work, "s.e57")
+        e = pye57.E57(ep, mode="w")
+        for tx in ([10.0, 20.0, 0.5], [40.0, 20.0, 0.5]):
+            loc = rng.uniform([0, 0, 0], [5, 5, 3], size=(2500, 3))
+            e.write_scan_raw({"cartesianX": np.ascontiguousarray(loc[:, 0]),
+                              "cartesianY": np.ascontiguousarray(loc[:, 1]),
+                              "cartesianZ": np.ascontiguousarray(loc[:, 2])},
+                             rotation=np.array([1.0, 0, 0, 0]), translation=np.array(tx, float))
+        del e
+        _li._E57_CHUNK = 1000                          # 2500 pts/scan -> multiple read() blocks
+        epts = _load_points(ep)
+        _li._E57_CHUNK = 5_000_000
+        assert len(epts) == 5000, f"e57 chunked read got {len(epts)} != 5000"
+
+        from lidar_align.refine import _rss_gb        # the [stage] RAM probe must work frozen
+        assert _rss_gb() > 0, "rss probe returned no value"
+
         print("SELFTEST OK"); _mark("OK"); return 0
     except Exception:
         tb = traceback.format_exc(); traceback.print_exc(); _mark("FAIL\n" + tb); return 1
