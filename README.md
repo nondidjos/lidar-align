@@ -59,9 +59,12 @@ with `scripts/run_sfm.*`, or bring your own from COLMAP / GLOMAP / GLUEMAP.
 > then runs it through `wsl`. Pick GLUEMAP as the SfM engine once it's installed.
 
 **Reference cloud** — `.las`/`.laz` stream from disk and get cropped to the photo volume as
-they read, so a huge survey never lands in RAM. `.e57` works directly (per-scan poses
-applied). Stations and metadata are ignored, only the points matter. For a big survey, thin
-it once: `python scripts/e57_to_laz.py site.e57 out.laz --voxel 0.03`.
+they read, so a huge survey never lands in RAM. `.e57` works directly, read scan-by-scan in
+chunks (per-scan poses applied), so even a single billion-point setup doesn't blow memory.
+A multi-station e57 is often huge only because each station is stored separately; the GUI's
+**Merge scans** button collapses that overlap into one cloud at the native point spacing —
+written next to the source, no real detail lost — so later runs load in seconds. CLI
+equivalent: `python scripts/e57_to_laz.py site.e57 --voxel 0.03`.
 
 ## How it works
 
@@ -72,8 +75,12 @@ is left free, so those terms — not COLMAP's arbitrary frame — set position, 
 scale. A coarse pre-align gets the model roughly into place first: manual correspondences if
 you have them, otherwise FPFH or a centroid guess.
 
-Cost tracks the sparse point count, not the cloud size. The points query the cloud; the
-cloud is never walked whole, so a 200 GB scan is fine.
+The reference cloud streams from disk and is never held whole, so the cloud side scales to a
+huge survey. The bundle adjustment is the opposite story: it doesn't scale to millions of
+*model* points (the matrix factorisation blows up, and it runs single-threaded because the
+LiDAR cost is Python), so the model is reduced to a representative subset (`ba_max_points`,
+default 300k) before solving — plenty to constrain every camera pose, which is what the
+`.xmp` export needs. The saved sparse model is that subset.
 
 ## Output
 
@@ -98,6 +105,7 @@ cloud is never walked whole, so a 200 GB scan is fine.
 | `max_assoc_dist` | `0.5` | Furthest a point can match the cloud (m) |
 | `planarity_min` | `0.1` | Skip non-flat spots (edges, clutter) |
 | `early_stop_tol` | `0.0` | Stop once a round improves by less than this (m); 0 = off |
+| `ba_max_points` | `300000` | Reduce the model to this many points for the solve; higher = more accurate but slower; blank/0 = keep all (small models only) |
 | `xmp_pose_prior` | `locked` | How RealityScan treats the poses |
 
 The rest is in `config.example.yaml`. Manual `correspondences` are config-only.
