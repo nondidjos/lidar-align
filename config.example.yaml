@@ -29,6 +29,9 @@ inner_iters: 50        # Ceres iterations per round
 max_assoc_dist: 0.5    # m, final association radius for BOTH point-to-plane and nearest-neighbour
 planarity_min: 0.1     # drop non-planar neighbourhoods (lines/edges/clutter now score ~0)
 max_lidar_residuals: 30000  # cap LiDAR ties per round (spatially even) — keeps it fast at scale
+ba_max_points: 300000  # reduce the model to this many points before solving (the BA doesn't scale
+                       # to millions; poses stay constrained). Higher = more accurate but slower;
+                       # 0 = keep all (small models only).
 anneal: true           # loose+soft -> tight+sharp schedule across outer_iters
 fix_intrinsics: true   # hold camera calibration fixed (correct pose/structure, not lens)
 

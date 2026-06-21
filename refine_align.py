@@ -28,6 +28,9 @@ def main():
     ap.add_argument("--planarity-min", type=float)
     ap.add_argument("--max-lidar-residuals", type=int,
                     help="cap LiDAR ties per round (spatially even) for speed at scale")
+    ap.add_argument("--ba-max-points", type=int,
+                    help="reduce the model to this many points before solving (default 300000; "
+                         "higher = more accurate but slower; 0 = keep all, small models only)")
     ap.add_argument("--early-stop-tol", type=float, default=0.0,
                     help="stop if median pt2plane improvement < this (metres) between rounds")
     ap.add_argument("--prealign", dest="prealign", action="store_true", default=None,
@@ -64,6 +67,7 @@ def main():
         max_assoc_dist=pick(args.max_assoc_dist, "max_assoc_dist", 0.5),
         planarity_min=pick(args.planarity_min, "planarity_min", 0.1),
         max_lidar_residuals=pick(args.max_lidar_residuals, "max_lidar_residuals", 30000),
+        ba_max_points=pick(args.ba_max_points, "ba_max_points", 300_000),
         anneal=pick(args.anneal, "anneal", True),
         prealign=pick(args.prealign, "prealign", False),
         prealign_method=pick(args.prealign_method, "prealign_method", "auto"),
