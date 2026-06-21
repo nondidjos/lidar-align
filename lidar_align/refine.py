@@ -295,16 +295,21 @@ def refine(sparse_in, lidar, sparse_out,
                           fix_intrinsics=fix_intrinsics, cancel_cb=cancel_cb,
                           early_stop_tol=early_stop_tol, verbose=verbose)
 
+    # Always save what we have (a stopped run still leaves a partially-aligned model), but skip
+    # the slow QA plane-query and XMP export on cancel so Stop returns promptly.
+    cancelled = cancel_cb is not None and cancel_cb()
     colmap_io.save(rec, sparse_out)
     print(f"wrote refined model -> {sparse_out}")
 
-    if qa_out:
+    if qa_out and not cancelled:
         from . import qa
         d1, _ = qa.residual_ply(rec, planes, os.path.join(qa_out, "residual_after.ply"),
                                 dmax=dmax)
         print(f"QA after:  {qa.residual_stats(d1)}")
 
-    if xmp_out:
+    if xmp_out and not cancelled:
         from .export_xmp import export_xmp
         n = export_xmp(rec, xmp_out, pose_prior=xmp_pose_prior, axis_flip=xmp_axis_flip)
         print(f"exported {n} RealityScan .xmp pose sidecars -> {xmp_out}")
+    if cancelled:
+        print("[stopped] skipped QA/XMP export; saved the partial model only")

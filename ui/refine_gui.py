@@ -1125,7 +1125,8 @@ class App:
             self._throb_state = (self._throb_state + 1) % 4
             el = int(now - self._job_start)
             self.status_throb.config(text="⠋⠙⠹⠸"[self._throb_state])
-            self.status_text.config(text=f"running  {el // 60:d}:{el % 60:02d}")
+            state = "stopping" if self._cancel.is_set() else "running"
+            self.status_text.config(text=f"{state}  {el // 60:d}:{el % 60:02d}")
             quiet = now - self._last_output
             if quiet >= 60 and now - self._last_beat >= 60:   # only when genuinely silent
                 self._last_beat = now
@@ -1153,8 +1154,11 @@ class App:
     def stop(self):
         if self._worker and self._worker.is_alive():
             self._cancel.set()
-            _kill_tree(self._proc)   # kill the live subprocess now (don't wait on a blocked read)
-            self._append("\n[stopping…]\n")
+            _kill_tree(self._proc)   # SfM runs as a subprocess: kill it now (don't wait on a blocked read)
+            # The align/merge run in-process and can't be hard-killed mid-solve; they stop at the
+            # next safe point (between scans while loading, between rounds while solving). The
+            # throbber keeps spinning and the status reads "stopping" so it doesn't look frozen.
+            self._append("\n[stopping — SfM stops now; align/merge finish the current step first]\n")
             self.stop_btn.config(state="disabled")
 
     def _drain(self):
