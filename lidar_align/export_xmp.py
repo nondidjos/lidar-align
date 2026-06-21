@@ -4,11 +4,11 @@ This closes the loop: take the LiDAR-corrected poses and re-import them into Rea
 (locked pose priors) so RealityScan does the dense mesh + texture with the correct
 alignment.
 
-RealityCapture / RealityScan `xcr` convention (from the XMP help):
-  xcr:Position  = camera centre C in world coordinates
-  xcr:Rotation  = 3x3 world->camera rotation, row-major (9 values), in RC camera axes
-  xcr:PosePrior = "locked" (fixed) | "initial" (adjustable) | "exact"
-  xcr:Coordinates = "absolute"
+RealityCapture / RealityScan `xcr` convention (matches RS's own native XMP):
+  xcr:Position  = camera centre C in world coordinates (child element)
+  xcr:Rotation  = 3x3 world->camera rotation, row-major (9 values), child element, RC axes
+  xcr:PosePrior = "locked" (fixed) | "initial" (adjustable)   - rdf:Description attribute
+  xcr:Coordinates = "absolute"                                - rdf:Description attribute
 
 RC camera axes differ from COLMAP's computer-vision axes (COLMAP: +x right, +y down,
 +z forward). The common mapping flips Y and Z:  R_rc = F @ R_cw,  F = diag(1,-1,-1).
@@ -34,8 +34,8 @@ _XMP = """<x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:Description xmlns:xcr="http://www.capturingreality.com/ns/xcr/1.1#"
    xcr:Version="3"
    xcr:PosePrior="{prior}"
-   xcr:Coordinates="absolute"
-   xcr:Rotation="{rot}">
+   xcr:Coordinates="absolute">
+   <xcr:Rotation>{rot}</xcr:Rotation>
    <xcr:Position>{pos}</xcr:Position>
   </rdf:Description>
  </rdf:RDF>
@@ -87,7 +87,7 @@ def read_xmp_pose(path):
     """Parse an .xmp back to (R_rc 3x3, C). For round-trip verification."""
     import re
     s = open(path).read()
-    rot = re.search(r'xcr:Rotation="([^"]+)"', s).group(1)
+    rot = re.search(r"<xcr:Rotation>([^<]+)</xcr:Rotation>", s).group(1)
     pos = re.search(r"<xcr:Position>([^<]+)</xcr:Position>", s).group(1)
     R_rc = np.array([float(v) for v in rot.split()], float).reshape(3, 3)
     C = np.array([float(v) for v in pos.split()], float)
