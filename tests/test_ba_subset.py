@@ -25,8 +25,20 @@ import pycolmap
 import laspy
 from pycolmap import Rotation3d, Sim3d
 
-from lidar_align.refine import _voxel_pick, _subsample_model, refine
+from lidar_align.refine import _voxel_pick, _subsample_model, _spatial_subsample, refine
 from lidar_align.export_xmp import camera_pose
+
+
+def test_spatial_subsample_outlier_robust():
+    # 60k real points in a ~60 m box + a few junk points flung tens of km out (real SfM data).
+    # Raw min/max grid sizing would collapse all ties to a handful; the percentile grid must not.
+    rng = np.random.default_rng(0)
+    real = rng.uniform(-30, 30, size=(60000, 3))
+    out = rng.uniform(-53000, 53000, size=(80, 3))
+    X = np.vstack([real, out]); plan = rng.uniform(0, 1, len(X)); idx = np.arange(len(X))
+    sel = _spatial_subsample(X, plan, idx, 30000)
+    assert len(sel) > 15000, f"outliers collapsed tie selection: only {len(sel)} of 30000"
+    print(f"  spatial_subsample: {len(sel):,} ties kept despite 80 km-scale outliers")
 
 
 def test_voxel_pick_outlier_robust():
@@ -100,6 +112,7 @@ def test_tie_heavy_refine_completes_and_recovers():
 
 if __name__ == "__main__":
     test_voxel_pick_outlier_robust()
+    test_spatial_subsample_outlier_robust()
     test_subsample_model()
     test_tie_heavy_refine_completes_and_recovers()
     print("BA SUBSET/SCALE TEST: PASS")

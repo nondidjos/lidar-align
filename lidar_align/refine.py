@@ -142,9 +142,15 @@ def _spatial_subsample(X, plan, idx, cap):
     if cap is None or len(idx) <= cap:
         return idx
     pts = X[idx]
-    lo = pts.min(0)
-    cell = np.maximum(pts.max(0) - lo, 1e-9) / max(round(cap ** (1.0 / 3.0)), 1)
-    keys = np.floor((pts - lo) / cell).astype(np.int64)
+    # Size the grid from the 1-99 percentile extent, NOT raw min/max: a few junk SfM points
+    # flung kilometres out would otherwise blow the cell size up so the whole real model lands
+    # in one voxel, collapsing thousands of ties down to a handful. Clip keys into the grid so
+    # those outliers just share edge cells.
+    lo = np.percentile(pts, 1.0, axis=0)
+    hi = np.percentile(pts, 99.0, axis=0)
+    B = max(round(cap ** (1.0 / 3.0)), 1) + 1
+    cell = np.maximum(hi - lo, 1e-9) / B
+    keys = np.clip(np.floor((pts - lo) / cell), 0, B - 1).astype(np.int64)
     order = np.argsort(-plan[idx])              # most-planar first
     ki = keys[order]
     span = [int(v) + 1 for v in ki.max(0)]     # keys are >= 0 already (shifted by lo)
