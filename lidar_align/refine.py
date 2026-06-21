@@ -65,8 +65,10 @@ def _make_adjuster(rec, fix_intrinsics, inner_iters):
     config = pycolmap.BundleAdjustmentConfig()
     for image_id in rec.reg_image_ids():
         config.add_image(image_id)
-    for pid in rec.points3D:
-        config.add_variable_point(pid)
+    # Points observed by the added images are optimised by default - we do NOT loop
+    # add_variable_point over every point. That loop was a redundant 3.7M-iteration Python
+    # call that held the GIL (freezing the UI) and added minutes to the build, with zero
+    # effect on the result (verified: the synth case recovers identically without it).
     # LiDAR is the datum -> do not let BA pin the gauge to the arbitrary SfM frame.
     config.fix_gauge(pycolmap.BundleAdjustmentGauge.UNSPECIFIED)
 
