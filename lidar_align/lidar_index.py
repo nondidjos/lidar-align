@@ -17,6 +17,8 @@ import os
 import numpy as np
 from scipy.spatial import cKDTree
 
+_E57_CHUNK = 5_000_000   # points per e57 read() block; bounds RAM on billion-point scans
+
 
 def _voxel(pts: np.ndarray, voxel: float) -> np.ndarray:
     """Keep one point per voxel (first seen)."""
@@ -77,28 +79,49 @@ def _load_points(path, voxel=None, crop_aabb=None, crop_margin=0.0, max_points=N
         nscan = e.scan_count
         kept = []
         kept_n = 0
+        # A single Leica/RTC360 setup can hold ~1e9 points; pye57.read_scan loads the whole
+        # scan AND makes a transposed copy in to_global (23+ GiB), which OOMs. Read each scan in
+        # bounded chunks instead: make_buffers(fields, CHUNK) then loop reader.read(), applying
+        # the per-scan pose to each small chunk, and crop+voxel before accumulating.
+        CHUNK = _E57_CHUNK
         for i in range(nscan):
             _stop()
-            d = e.read_scan(i, transform=True, ignore_missing_fields=True)
-            try:
-                xyz = np.column_stack([d["cartesianX"], d["cartesianY"], d["cartesianZ"]])
-            except KeyError:
+            header = e.get_header(i)
+            if "cartesianX" not in header.point_fields:
                 raise ValueError(
                     f"e57 scan {i} has no cartesian points (spherical-only e57 is "
                     f"unsupported; re-export cartesian or convert with scripts/e57_to_laz.py)")
-            xyz = xyz.astype(np.float64)
-            xyz = xyz[np.isfinite(xyz).all(axis=1)]      # drop invalid/empty returns
-            if lo is not None:
-                m = np.all((xyz >= lo) & (xyz <= hi), axis=1)
-                xyz = xyz[m]
-            if voxel and len(xyz):
-                xyz = _voxel(xyz, voxel)
-            if len(xyz):
-                kept.append(xyz)
-                kept_n += len(xyz)
+            fields = [f for f in ("cartesianX", "cartesianY", "cartesianZ", "cartesianInvalidState")
+                      if f in header.point_fields]
+            cap = min(CHUNK, max(int(header.point_count), 1))   # don't over-allocate small scans
+            data, buffers = e.make_buffers(fields, cap)
+            reader = header.points.reader(buffers)
+            has_pose = header.has_pose()
+            try:
+                while True:
+                    _stop()
+                    got = reader.read()                  # fills buffers, returns count (0 at EOF)
+                    if not got:
+                        break
+                    xyz = np.column_stack([data["cartesianX"][:got], data["cartesianY"][:got],
+                                           data["cartesianZ"][:got]]).astype(np.float64)
+                    if "cartesianInvalidState" in data:
+                        xyz = xyz[~data["cartesianInvalidState"][:got].astype(bool)]
+                    xyz = xyz[np.isfinite(xyz).all(axis=1)]
+                    if has_pose and len(xyz):
+                        xyz = e.to_global(xyz, header.rotation, header.translation)
+                    if lo is not None:
+                        xyz = xyz[np.all((xyz >= lo) & (xyz <= hi), axis=1)]
+                    if voxel and len(xyz):
+                        xyz = _voxel(xyz, voxel)
+                    if len(xyz):
+                        kept.append(xyz)
+                        kept_n += len(xyz)
+            finally:
+                reader.close()
             _log(f"  scan {i + 1}/{nscan}: {kept_n:,} pts kept\n")
         pts = np.concatenate(kept) if kept else np.empty((0, 3))
-        pts = _voxel(pts, voxel)                          # merge per-scan voxel overlaps
+        pts = _voxel(pts, voxel)                          # merge per-scan/-chunk voxel overlaps
     else:
         import open3d as o3d
         pc = o3d.io.read_point_cloud(path)
