@@ -24,8 +24,51 @@ import numpy as np
 import pyceres
 import pycolmap
 
+import time
+
 from . import colmap_io
 from .lidar_index import LidarPlanes
+
+
+def _rss_gb():
+    """Resident memory in GB (psutil if available, else Windows ctypes, else -1)."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / 1e9
+    except Exception:
+        pass
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class _PMC(ctypes.Structure):
+            _fields_ = [("cb", wt.DWORD), ("PageFaultCount", wt.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+        c = _PMC(); c.cb = ctypes.sizeof(_PMC)
+        if ctypes.windll.psapi.GetProcessMemoryInfo(
+                ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(c), c.cb):
+            return c.WorkingSetSize / 1e9
+    except Exception:
+        pass
+    return -1.0
+
+
+class _Stages:
+    """Print '[stage +M:SS  RAM X.XGB] label' markers so a run shows where time and memory go."""
+    def __init__(self, enabled=True):
+        self.t0 = time.time()
+        self.enabled = enabled
+
+    def __call__(self, label):
+        if not self.enabled:
+            return
+        el = int(time.time() - self.t0)
+        rss = _rss_gb()
+        ram = f"{rss:.1f}GB" if rss >= 0 else "n/a"
+        print(f"[stage +{el // 60:d}:{el % 60:02d}  RAM {ram}] {label}")
 
 
 class PointToPlaneCost(pyceres.CostFunction):
@@ -128,7 +171,7 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
                           outer_iters=5, inner_iters=50, max_assoc_dist=0.5,
                           planarity_min=0.1, anneal=True, max_lidar_residuals=30000,
                           fix_intrinsics=True, verbose=True, cancel_cb=None,
-                          early_stop_tol=0.0, prev_err=None):
+                          early_stop_tol=0.0, prev_err=None, stage=None):
     """Refine an in-memory reconstruction against a LidarPlanes index. Mutates `rec`.
 
     Annealing (when `anneal`): early rounds use a loose association radius, soft robust
@@ -144,9 +187,11 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
     # Build the bundle adjuster (the reprojection problem over ALL images + points) ONCE and
     # reuse it every round - rebuilding it per round re-creates millions of residual blocks
     # outer_iters times. Each round we only swap the (<= cap) LiDAR point-to-plane blocks.
+    _stage = stage if stage is not None else (lambda *a: None)
     ba = _make_adjuster(rec, fix_intrinsics, inner_iters)
     problem = ba.problem
     lidar_blocks = []
+    _stage("built bundle adjuster")
     # Cap the per-round nearest-plane query: a few thousand well-spread ties pin the gauge and
     # warp; querying every point each round is wasted k-NN + PCA work at 7k-image scale.
     cand_cap = max(8 * max_lidar_residuals, 200_000)
@@ -164,6 +209,7 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
     cand_pts = [all_objs[k] for k in cand]
     n_cand = len(cand_pts)
     del all_objs, X_all
+    _stage(f"picked {n_cand:,} candidate points")
 
     for it in range(outer_iters):
         if cancel_cb is not None and cancel_cb():        # cooperative stop between rounds
@@ -215,8 +261,9 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
                 PointToPlaneCost(C[k], N[k], w), loss, [cand_pts[k].xyz])
             lidar_blocks.append(bid)
         if verbose:
-            print(f"[outer {it}] solving…")
+            print(f"[outer {it}] solving… ({len(sel):,} lidar ties)")
         ba.solve()
+        _stage(f"round {it} solved")
 
         # residual stats (used by both the log line and early stopping, so always computed)
         dk = dist[sel]
@@ -252,8 +299,10 @@ def refine(sparse_in, lidar, sparse_out,
            cancel_cb=None, early_stop_tol=0.0, verbose=True):
     from .lidar_index import _load_points
 
+    stage = _Stages(enabled=verbose)
     rec = colmap_io.load(sparse_in)
     print(f"loaded {rec.num_reg_images()} images, {rec.num_points3D()} points")
+    stage(f"loaded reconstruction ({rec.num_reg_images()} imgs, {rec.num_points3D():,} pts)")
 
     if prealign:
         from .prealign import prealign_reconstruction
@@ -264,6 +313,7 @@ def refine(sparse_in, lidar, sparse_out,
                                        method=prealign_method, voxel=prealign_voxel)
         print(f"prealign[{prealign_method}]: scale={info['scale']:.4f} "
               f"fitness={info['fitness']:.3f} rmse={info['inlier_rmse']:.3f}")
+        stage("pre-align done")
 
     # units sanity: SfM extent (post-prealign) should match the LiDAR's metric scale
     lo, hi = _sfm_aabb(rec)
@@ -278,6 +328,7 @@ def refine(sparse_in, lidar, sparse_out,
                                        crop_margin=crop_margin, k_plane=k_plane,
                                        log=(print if verbose else None), cancel_cb=cancel_cb)
     print(f"lidar index: {planes.pts.shape[0]:,} points (cropped to SfM volume)")
+    stage(f"built lidar index ({planes.pts.shape[0]:,} cloud pts)")
 
     # foot-gun: the nearest-neighbour gate needs assoc > LiDAR point spacing, else every
     # valid point is rejected (nn ~ voxel). Warn if the user downsampled too aggressively.
@@ -305,19 +356,21 @@ def refine(sparse_in, lidar, sparse_out,
         os.makedirs(qa_out, exist_ok=True)
         d0, dmax = qa.residual_ply(rec, planes, os.path.join(qa_out, "residual_before.ply"))
         print(f"QA before: {qa.residual_stats(d0)}")
+        stage("QA before written")
 
     refine_reconstruction(rec, planes, w_lidar=w_lidar, huber=huber,
                           outer_iters=outer_iters, inner_iters=inner_iters,
                           max_assoc_dist=max_assoc_dist, planarity_min=planarity_min,
                           anneal=anneal, max_lidar_residuals=max_lidar_residuals,
                           fix_intrinsics=fix_intrinsics, cancel_cb=cancel_cb,
-                          early_stop_tol=early_stop_tol, verbose=verbose)
+                          early_stop_tol=early_stop_tol, verbose=verbose, stage=stage)
 
     # Always save what we have (a stopped run still leaves a partially-aligned model), but skip
     # the slow QA plane-query and XMP export on cancel so Stop returns promptly.
     cancelled = cancel_cb is not None and cancel_cb()
     colmap_io.save(rec, sparse_out)
     print(f"wrote refined model -> {sparse_out}")
+    stage("saved refined model")
 
     if qa_out and not cancelled:
         from . import qa

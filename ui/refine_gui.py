@@ -156,6 +156,27 @@ class _QueueWriter(io.TextIOBase):
         pass
 
 
+class _Tee(io.TextIOBase):
+    """Fan writes out to several streams (e.g. the GUI log queue AND an on-disk log file)."""
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, s):
+        for st in self._streams:
+            try:
+                st.write(s)
+            except Exception:
+                pass
+        return len(s)
+
+    def flush(self):
+        for st in self._streams:
+            try:
+                st.flush()
+            except Exception:
+                pass
+
+
 def _validate_images_dir(images_dir, sparse_out):
     """After refine(): check the model's image names resolve under images_dir."""
     try:
@@ -1064,12 +1085,19 @@ class App:
 
     def _refine_worker(self, kwargs, images_dir):
         kwargs["cancel_cb"] = self._cancel.is_set
+        # Tee the whole run (stage timings, RAM, per-round stats) to a log file in the output
+        # folder so a long align leaves a record even after the on-screen log scrolls past.
+        proj = os.path.dirname(kwargs["sparse_out"]) or "."
+        log_path = os.path.join(proj, "align_" + time.strftime("%Y%m%d_%H%M%S") + ".log")
         try:
             from lidar_align.refine import refine
-            with contextlib.redirect_stdout(_QueueWriter(self.q)):
-                refine(**kwargs)
-                if images_dir and kwargs.get("xmp_out"):
-                    _validate_images_dir(images_dir, kwargs["sparse_out"])
+            os.makedirs(proj, exist_ok=True)
+            with open(log_path, "w", encoding="utf-8") as lf:
+                self.q.put(("log", f"(full log -> {log_path})\n"))
+                with contextlib.redirect_stdout(_Tee(_QueueWriter(self.q), lf)):
+                    refine(**kwargs)
+                    if images_dir and kwargs.get("xmp_out"):
+                        _validate_images_dir(images_dir, kwargs["sparse_out"])
             self.q.put(("done", 0))
         except KeyboardInterrupt:                          # cooperative Stop during cloud load
             self.q.put(("log", "\n[cancelled]\n"))
