@@ -12,6 +12,7 @@ VOCAB="${3:-data/vocab_tree.bin}"
 CAMERA_MODEL="${4:-OPENCV}"         # OPENCV (rectilinear) or OPENCV_FISHEYE (very wide)
 METHOD="${5:-GLOMAP}"               # GLOMAP or GLUEMAP
 GLUEMAP_CONFIG="${6:-}"
+MAX_FEATURES="${7:-4096}"           # matches the GUI's Balanced preset; raise for more detail
 
 mkdir -p "$WORK"
 
@@ -28,15 +29,17 @@ fi
 
 DB="$WORK/database.db"
 
+# GPU SIFT at 4096 features. NOTE: --SiftExtraction.estimate_affine_shape / --domain_size_pooling
+# improve matches on blurry frames but force COLMAP onto CPU-only SIFT, which on thousands of
+# sharp frames means a multi-hour run and a huge database - so they are deliberately NOT used
+# here. Only add them for genuinely soft footage.
 echo "== feature_extractor =="
 colmap feature_extractor \
   --database_path "$DB" \
   --image_path "$IMAGES" \
   --ImageReader.single_camera 1 \
   --ImageReader.camera_model "$CAMERA_MODEL" \
-  --SiftExtraction.max_num_features 8192 \
-  --SiftExtraction.estimate_affine_shape 1 \
-  --SiftExtraction.domain_size_pooling 1 \
+  --SiftExtraction.max_num_features "$MAX_FEATURES" \
   --FeatureExtraction.use_gpu 1
 
 echo "== sequential_matcher (video order + loop closure) =="

@@ -11,7 +11,8 @@ param(
   [string]$VocabTree   = "data/vocab_tree.bin",
   [string]$CameraModel = "OPENCV",        # OPENCV for rectilinear Osmo; OPENCV_FISHEYE if very wide
   [string]$Method      = "GLOMAP",        # GLOMAP or GLUEMAP
-  [string]$GluemapConfig = ""             # Optional path to GLUEMAP config YAML
+  [string]$GluemapConfig = "",            # Optional path to GLUEMAP config YAML
+  [int]$MaxFeatures    = 4096             # matches the GUI's Balanced preset; raise for more detail
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,15 +32,17 @@ if ($Method -eq "GLUEMAP") {
 
 $db = Join-Path $Work "database.db"
 
+# GPU SIFT at 4096 features. NOTE: --SiftExtraction.estimate_affine_shape /
+# --domain_size_pooling improve matches on blurry frames but force COLMAP onto CPU-only SIFT,
+# which on thousands of sharp frames means a multi-hour run and a huge database - so they are
+# deliberately NOT used here. Only add them for genuinely soft footage.
 Write-Host "== feature_extractor =="
 colmap feature_extractor `
   --database_path $db `
   --image_path $Images `
   --ImageReader.single_camera 1 `
   --ImageReader.camera_model $CameraModel `
-  --SiftExtraction.max_num_features 8192 `
-  --SiftExtraction.estimate_affine_shape 1 `
-  --SiftExtraction.domain_size_pooling 1 `
+  --SiftExtraction.max_num_features $MaxFeatures `
   --FeatureExtraction.use_gpu 1
 if (-not $?) { throw "feature_extractor failed" }
 
