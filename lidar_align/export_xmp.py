@@ -86,8 +86,25 @@ def _resolve_flip(axis_flip):
     return np.asarray(axis_flip, float)
 
 
+def _outlier_camera_ids(rec, factor=30.0, floor=1000.0):
+    """Image ids whose camera centre is a far-flung outlier - a pose that drifted in an
+    underconstrained solve. Robust: distance from the median centre beyond `factor` x the median
+    such distance (or `floor` metres, whichever is larger). Empty when the centres are coherent,
+    so it's a no-op on a clean run; only the genuine flyers (km-scale here) get dropped. If the
+    majority drifted the median itself is bad and this can't help - that needs a re-align.
+    """
+    items = [(iid, camera_pose(im)[1]) for iid, im in rec.images.items() if im.has_pose]
+    if len(items) < 8:
+        return set()
+    C = np.array([c for _, c in items])
+    d = np.linalg.norm(C - np.median(C, axis=0), axis=1)
+    thresh = max(factor * float(np.median(d)), floor)
+    return {iid for (iid, _), di in zip(items, d) if di > thresh}
+
+
 def export_xmp(rec, out_dir, pose_prior="locked", axis_flip=None,
-               include_intrinsics=True, calib_prior="initial", only=None):
+               include_intrinsics=True, calib_prior="initial", only=None,
+               drop_outlier_cameras=True):
     """Write one <image_basename>.xmp per registered image. Returns the count.
 
     `include_intrinsics`: also write the SfM-solved focal/principal-point as an RS calibration
@@ -95,12 +112,18 @@ def export_xmp(rec, out_dir, pose_prior="locked", axis_flip=None,
     with no EXIF focal, which RS would otherwise have nothing to seed from.
     `only`: if set, export just the image whose name (or basename) matches - handy for quickly
     A/B-ing axis flips on a single image without writing the whole set.
+    `drop_outlier_cameras`: skip cameras whose pose drifted far from the rest (flung by an
+    underconstrained solve) so they don't wreck RealityScan's scene extent. No-op on a clean run.
     """
     F = _resolve_flip(axis_flip)
     os.makedirs(out_dir, exist_ok=True)
+    drop = _outlier_camera_ids(rec) if (drop_outlier_cameras and not only) else set()
+    if drop:
+        print(f"[xmp] skipping {len(drop)} far-outlier camera(s) with drifted poses; "
+              f"exporting the well-placed ones")
     n = 0
-    for image in rec.images.values():
-        if not image.has_pose:
+    for iid, image in rec.images.items():
+        if not image.has_pose or iid in drop:
             continue
         if only and image.name != only and os.path.basename(image.name) != only:
             continue
