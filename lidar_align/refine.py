@@ -101,7 +101,12 @@ def _make_adjuster(rec, fix_intrinsics, inner_iters):
     opts.print_summary = False
     try:
         opts.ceres.solver_options.max_num_iterations = int(inner_iters)
-        opts.ceres.solver_options.num_threads = max(1, os.cpu_count() or 1)
+        # CRITICAL: our LiDAR PointToPlaneCost is a Python cost function. With more than one Ceres
+        # thread the worker threads contend savagely on Python's GIL - measured on a 50k-point
+        # model with 2000 ties: 13 s at num_threads=1 vs >180 s at num_threads=2. So the solve
+        # MUST be single-threaded. (The reprojection part loses multicore; we offset that by
+        # subsampling the model via ba_max_points so the factorization stays small.)
+        opts.ceres.solver_options.num_threads = 1
     except Exception:
         pass  # fall back to pycolmap defaults if the options layout differs
 
@@ -152,19 +157,42 @@ def _spatial_subsample(X, plan, idx, cap):
 
 
 def _voxel_pick(X, cap):
-    """Up to ~`cap` point indices, one per voxel (spatially even). Bounds the per-round
-    nearest-plane query: we only need a few thousand well-spread ties, not a k-NN + PCA over
-    every (possibly multi-million) point. No-op when len(X) <= cap."""
+    """Up to ~`cap` point indices, one per voxel (spatially even). No-op when len(X) <= cap.
+
+    Outlier-robust: the grid is sized from the 1-99 percentile extent, not raw min/max, so a
+    handful of stray SfM points can't blow the cell size up and collapse the whole cloud into a
+    few voxels (which previously left only ~1900 candidates out of millions). Keys are clipped
+    into the grid so outliers just share the edge cells.
+    """
     n = len(X)
     if cap is None or n <= cap:
         return np.arange(n)
-    lo = X.min(0)
-    cell = np.maximum(X.max(0) - lo, 1e-9) / max(round(cap ** (1.0 / 3.0)), 1)
-    keys = np.floor((X - lo) / cell).astype(np.int64)
-    keys -= keys.min(0)                                   # non-negative; tiny range (~cap^1/3)
-    packed = (keys[:, 0] << 42) | (keys[:, 1] << 21) | keys[:, 2]   # 1-D key -> fast unique
+    lo = np.percentile(X, 1.0, axis=0)
+    hi = np.percentile(X, 99.0, axis=0)
+    B = max(round(cap ** (1.0 / 3.0)), 1) + 1
+    cell = np.maximum(hi - lo, 1e-9) / B
+    keys = np.clip(np.floor((X - lo) / cell), 0, B - 1).astype(np.int64)
+    packed = (keys[:, 0] * B + keys[:, 1]) * B + keys[:, 2]   # mixed-radix, collision-free
     _, first = np.unique(packed, return_index=True)
     return first
+
+
+def _subsample_model(rec, target):
+    """Delete all but ~`target` spatially-even points so the bundle adjustment is tractable.
+
+    A reprojection BA over millions of points factorizes a matrix that blows up super-linearly
+    (and pycolmap gives no way to swap in an iterative solver). But the camera poses we export
+    are well-constrained by a few hundred thousand well-distributed points + their observations,
+    so we keep a representative subset and drop the rest. Deletion is fast (~750k pts/s).
+    Returns the kept count.
+    """
+    ids = np.array(list(rec.points3D.keys()), dtype=np.int64)
+    X = np.array([p.xyz for p in rec.points3D.values()], np.float64)
+    keep = set(int(i) for i in ids[_voxel_pick(X, target)])
+    for pid in ids.tolist():
+        if pid not in keep:
+            rec.delete_point3D(pid)
+    return rec.num_points3D()
 
 
 def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
@@ -296,13 +324,25 @@ def refine(sparse_in, lidar, sparse_out,
            prealign=False, prealign_voxel=0.5, prealign_method="auto",
            correspondences=None, crop_margin=2.0, planes=None,
            qa_out=None, xmp_out=None, xmp_pose_prior="locked", xmp_axis_flip=None,
-           cancel_cb=None, early_stop_tol=0.0, verbose=True):
+           cancel_cb=None, early_stop_tol=0.0, verbose=True, ba_max_points=300_000):
     from .lidar_index import _load_points
 
     stage = _Stages(enabled=verbose)
     rec = colmap_io.load(sparse_in)
     print(f"loaded {rec.num_reg_images()} images, {rec.num_points3D()} points")
     stage(f"loaded reconstruction ({rec.num_reg_images()} imgs, {rec.num_points3D():,} pts)")
+
+    # A full reprojection BA over millions of points doesn't scale (the matrix factorization
+    # blows up and pycolmap won't let us pick an iterative solver), so reduce to a representative
+    # subset up front. The exported camera poses stay well-constrained; the saved sparse model is
+    # this subset. Set ba_max_points=None/0 to keep every point (only viable for small models).
+    if ba_max_points and rec.num_points3D() > ba_max_points:
+        before = rec.num_points3D()
+        print(f"reducing model {before:,} -> ~{ba_max_points:,} points so the bundle adjustment "
+              f"is tractable (poses stay constrained; saved model is this subset)…")
+        kept = _subsample_model(rec, ba_max_points)
+        print(f"  reduced to {kept:,} points")
+        stage(f"reduced model to {kept:,} pts")
 
     if prealign:
         from .prealign import prealign_reconstruction

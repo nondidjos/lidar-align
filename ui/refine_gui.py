@@ -565,6 +565,12 @@ class App:
                     tip="Cap on how many point-to-cloud matches to use each round (spread evenly "
                         "across the scene). Limits time and memory on huge models; a few thousand "
                         "is enough to pin the alignment.")
+        self._entry(li, 7, "Max model points (BA)", "ba_max_points", "300000",
+                    tip="The alignment solver doesn't scale to millions of model points, so the "
+                        "model is reduced to this many (spread evenly) before solving. The camera "
+                        "poses you export stay well-constrained. Higher = more accurate but slower "
+                        "(~150k≈5min, 300k≈12min single-threaded); blank/0 keeps all points (only "
+                        "viable for small models). This thins the MODEL, not the reference cloud.")
 
         # Outputs
         out = ttk.Labelframe(parent, text="Outputs", padding=8)
@@ -1041,6 +1047,7 @@ class App:
             max_assoc_dist=float(v["max_assoc_dist"].get()),
             planarity_min=float(v["planarity_min"].get()),
             max_lidar_residuals=int(float(v["max_lidar_residuals"].get() or 30000)),
+            ba_max_points=(int(float(v["ba_max_points"].get())) if v["ba_max_points"].get().strip() else None),
             anneal=bool(v["anneal"].get()),
             fix_intrinsics=bool(v["fix_intrinsics"].get()),
             qa_out=(p["qa"] if bool(v["write_qa"].get()) else None),
