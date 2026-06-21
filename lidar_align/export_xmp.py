@@ -87,18 +87,22 @@ def _resolve_flip(axis_flip):
 
 
 def export_xmp(rec, out_dir, pose_prior="locked", axis_flip=None,
-               include_intrinsics=True, calib_prior="initial"):
+               include_intrinsics=True, calib_prior="initial", only=None):
     """Write one <image_basename>.xmp per registered image. Returns the count.
 
     `include_intrinsics`: also write the SfM-solved focal/principal-point as an RS calibration
     prior (`calib_prior`, default "initial" = refinable). Strongly recommended for video frames
     with no EXIF focal, which RS would otherwise have nothing to seed from.
+    `only`: if set, export just the image whose name (or basename) matches - handy for quickly
+    A/B-ing axis flips on a single image without writing the whole set.
     """
     F = _resolve_flip(axis_flip)
     os.makedirs(out_dir, exist_ok=True)
     n = 0
     for image in rec.images.values():
         if not image.has_pose:
+            continue
+        if only and image.name != only and os.path.basename(image.name) != only:
             continue
         R, C = camera_pose(image)
         R_rc = F @ R
