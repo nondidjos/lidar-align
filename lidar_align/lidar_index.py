@@ -33,18 +33,23 @@ def read_crs(path):
     try:
         if ext == ".e57":
             import pye57
-            root = pye57.E57(p).root
-            if root.isDefined("coordinateMetadata"):
-                v = (root.get("coordinateMetadata").value() or "").strip()
-                return v or None
+            e = pye57.E57(p)                    # keep a live reference: a node from a destroyed
+            try:                                # E57 is backed by a closed file (can segfault)
+                root = e.root
+                if root.isDefined("coordinateMetadata"):
+                    v = (root.get("coordinateMetadata").value() or "").strip()
+                    return v or None
+            finally:
+                try:
+                    e.close()
+                except Exception:
+                    pass
         elif ext in (".las", ".laz"):
             import laspy
             with laspy.open(p) as f:
                 for vlr in list(f.header.vlrs) + list(getattr(f.header, "evlrs", []) or []):
-                    s = getattr(vlr, "string", None) or getattr(vlr, "record_data_bytes", None)
-                    if isinstance(s, bytes):
-                        s = s.decode("ascii", "ignore")
-                    if s and ("PROJCS" in s or "PROJCRS" in s or "GEOGCS" in s):
+                    s = getattr(vlr, "string", None)        # WKT VLR string (the common case)
+                    if isinstance(s, str) and ("PROJCS" in s or "PROJCRS" in s or "GEOGCS" in s):
                         return s.strip()
     except Exception:
         return None
