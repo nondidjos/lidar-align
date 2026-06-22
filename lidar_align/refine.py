@@ -566,6 +566,7 @@ def refine(sparse_in, lidar, sparse_out,
     # RealityScan can place them. `origin` is found from the cloud once and applied to the LiDAR at
     # load and to the model, then written out so the result georeferences back.
     origin = None
+    lidar_world_bbox = None        # the scan's NATIVE coordinate range (what RealityScan reads)
 
     # Pre-align on the FULL cleaned cloud (more points = better FPFH coverage for scale recovery);
     # we only thin the model AFTER, for the bundle adjustment.
@@ -574,6 +575,8 @@ def refine(sparse_in, lidar, sparse_out,
         print(f"pre-align: loading coarse cloud ({prealign_voxel} m voxel)…")
         coarse = _load_points(lidar, voxel=prealign_voxel,
                               log=(print if verbose else None), cancel_cb=cancel_cb)
+        if len(coarse):
+            lidar_world_bbox = (coarse.min(0).copy(), coarse.max(0).copy())
         origin = _origin_for(coarse)
         if origin is not None:
             coarse = coarse - origin                       # pre-align onto the LOCAL cloud
@@ -592,6 +595,8 @@ def refine(sparse_in, lidar, sparse_out,
         # find the georef origin, then bring that already-aligned (UTM) model into the local frame.
         peek = _load_points(lidar, voxel=max(prealign_voxel, 1.0), max_points=300_000,
                             log=(print if verbose else None), cancel_cb=cancel_cb)
+        if len(peek):
+            lidar_world_bbox = (peek.min(0).copy(), peek.max(0).copy())
         origin = _origin_for(peek)
         del peek
         if origin is not None:
@@ -755,6 +760,27 @@ def refine(sparse_in, lidar, sparse_out,
     colmap_io.save(rec, sparse_out)
     print(f"wrote refined model -> {sparse_out}")
     stage("saved refined model")
+
+    # Spell out WHERE everything landed, in the output frame, so a coordinate-frame mismatch with the
+    # scan you import into RealityScan is obvious. The cameras must sit inside the scan's coordinate
+    # range; if they don't, the .xmp is in a different frame than your scan (RS shows them far apart).
+    C = _camera_centers(rec)
+    if len(C):
+        cc, clo, chi = C.mean(0), C.min(0), C.max(0)
+        print(f"[placement] cameras: centre ({cc[0]:.2f} {cc[1]:.2f} {cc[2]:.2f})  "
+              f"X[{clo[0]:.1f} {chi[0]:.1f}] Y[{clo[1]:.1f} {chi[1]:.1f}] Z[{clo[2]:.1f} {chi[2]:.1f}]")
+        if lidar_world_bbox is not None:
+            llo, lhi = lidar_world_bbox
+            print(f"[placement] your scan : range "
+                  f"X[{llo[0]:.1f} {lhi[0]:.1f}] Y[{llo[1]:.1f} {lhi[1]:.1f}] Z[{llo[2]:.1f} {lhi[2]:.1f}]")
+            inside = np.all(cc >= llo - 50) and np.all(cc <= lhi + 50)
+            if inside:
+                print("[placement] OK - cameras sit inside the scan's range; in RealityScan they "
+                      "should land on the scan.")
+            else:
+                print("[placement] *** MISMATCH: cameras are OUTSIDE the scan's coordinate range. "
+                      "The .xmp and your scan are in different frames - that's why RealityScan shows "
+                      "the cameras far away. Send this block to debug the frame. ***")
 
     # Drop the scan's CRS next to the output so you have the exact system to confirm in RealityScan
     # (RS also reads it straight from your georeferenced scan on import).
