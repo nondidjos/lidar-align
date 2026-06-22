@@ -589,6 +589,13 @@ class App:
                         "large: 800k suits a 24-thread / 64 GB box. Higher = more accurate but "
                         "slower and heavier; lower on a weak machine; blank/0 keeps every point "
                         "(slow at millions). This thins the MODEL, not the reference cloud.")
+        self._path_row(li, 8, "Align points file (optional)", "corr_file", "", "file",
+                       tip="For scenes auto-align can't scale (stairs / repeated structure + partial "
+                           "overlap). A text file of 3+ lines 'model_x model_y model_z scan_x scan_y "
+                           "scan_z' - the SAME feature picked in the model and the scan. Load "
+                           "model_for_picking.ply (written next to the output) and your scan in "
+                           "CloudCompare, pick matching points, paste their coords. Pins the scale "
+                           "and pose exactly; leave blank to use auto-align.")
 
         # Outputs
         out = ttk.Labelframe(parent, text="Outputs", padding=8)
@@ -1050,9 +1057,15 @@ class App:
             xmp_out = self._abs(photos)
         else:
             xmp_out = None
+        corr_file = v["corr_file"].get().strip()
+        correspondences = None
+        if corr_file:
+            from lidar_align.refine import parse_correspondences
+            correspondences = parse_correspondences(self._abs(corr_file))
         kw = dict(
             sparse_in=p["sparse_in"], lidar=self._abs(lidar), sparse_out=p["sparse_out"],
             prealign=bool(v["prealign"].get()),
+            correspondences=correspondences,
             prealign_method=v["prealign_method"].get(),
             prealign_voxel=float(v["prealign_voxel"].get() or 0.5),
             voxel=(float(voxel) if voxel else None),

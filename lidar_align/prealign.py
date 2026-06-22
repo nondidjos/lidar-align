@@ -123,6 +123,10 @@ def robust_global_sim3(sfm_pts, lidar_pts, voxel=0.3):
     """
     import open3d as o3d
     from scipy.spatial import cKDTree
+    try:
+        o3d.utility.random.seed(0)   # deterministic RANSAC: same result every run, not a new wrong
+    except Exception:                # scale each time (it was 5.52 one run, 3.903 the next)
+        pass
     M = np.asarray(sfm_pts, np.float64)
     L = np.asarray(lidar_pts, np.float64)
     lpc = o3d.geometry.PointCloud(); lpc.points = o3d.utility.Vector3dVector(L)
@@ -218,7 +222,13 @@ def prealign_reconstruction(rec, lidar_pts, correspondences=None, method="auto",
         else:                                                # (src_array, dst_array)
             src = np.asarray(correspondences[0], np.float64)
             dst = np.asarray(correspondences[1], np.float64)
-        s, R, t, fit, rmse = scaled_icp(sfm_pts, lidar_pts, init=umeyama_sim3(src, dst), voxel=voxel)
+        init = umeyama_sim3(src, dst)
+        try:                                                 # polish, but never let ICP wreck the
+            s, R, t, fit, rmse = scaled_icp(sfm_pts, lidar_pts, init=init, voxel=voxel)
+            if not np.isfinite(s) or not (0.7 < s / init[0] < 1.4):
+                raise RuntimeError("ICP drifted from the correspondence scale")
+        except Exception:                                    # user-given scale (repetitive structure
+            s, R, t, fit, rmse = init[0], init[1], init[2], float("nan"), float("nan")  # is its anchor)
     elif method == "global":
         gs, gR, gt, gfit = global_register(sfm_pts, lidar_pts, voxel=voxel * 3)
         if gfit < 0.3:

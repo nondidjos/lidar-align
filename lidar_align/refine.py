@@ -95,6 +95,45 @@ def _solver_threads():
     return max(1, min(os.cpu_count() or 1, 32))
 
 
+def parse_correspondences(path):
+    """Read a point-pairs file for pinning the alignment when auto-scale can't (repetitive structure
+    like stairs + partial overlap). Each non-blank, non-'#' line is six numbers - the MODEL xyz then
+    the SCAN/LiDAR xyz of the same feature - whitespace or comma separated:
+
+        # model_x model_y model_z   scan_x scan_y scan_z
+        12.40 -3.11  8.02    18.7 -27.7  3.9
+        ...
+
+    Returns [[[mx,my,mz],[sx,sy,sz]], ...] for refine(correspondences=...). >= 3 non-collinear pairs
+    pin scale+rotation+translation exactly (Umeyama); the LiDAR refine then polishes."""
+    pairs = []
+    with open(path) as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            vals = [float(x) for x in ln.replace(",", " ").split()]
+            if len(vals) >= 6:
+                pairs.append([vals[0:3], vals[3:6]])
+    if len(pairs) < 3:
+        raise ValueError(f"correspondences file {path} has {len(pairs)} valid rows; need >= 3 "
+                         f"(each row: model_x model_y model_z scan_x scan_y scan_z)")
+    return pairs
+
+
+def _export_picking_ply(rec, path, cap=500_000):
+    """Write the (SfM-frame) model as a light PLY so the user can load it in CloudCompare next to the
+    scan and pick matching points for a correspondences file. Subsampled for a fast-loading file."""
+    from . import qa
+    ids = np.array(list(rec.points3D.keys()), dtype=np.int64)
+    if len(ids) == 0:
+        return
+    X = np.array([rec.points3D[int(i)].xyz for i in ids], np.float64)
+    keep = _voxel_pick(X, cap)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    qa.write_ply(path, X[keep], np.full((len(keep), 3), 220, np.uint8))
+
+
 def _native_plane_cost(plane_pt, plane_n, weight, soft=100.0):
     """Point-to-plane as a NATIVE (C++) NormalPrior cost so the bundle adjust can MULTI-THREAD.
 
@@ -559,6 +598,18 @@ def refine(sparse_in, lidar, sparse_out,
         print(f"cleaned {n_out:,} low-quality/outlier points (short tracks, high error, far flyers) "
               f"-> {rec.num_points3D():,} kept for alignment")
     stage(f"loaded reconstruction ({rec.num_reg_images()} imgs, {rec.num_points3D():,} pts)")
+
+    # Always drop a light SfM-frame PLY of the model next to the output. If auto-align can't lock the
+    # scale (repetitive structure like stairs + partial overlap), load THIS in CloudCompare beside
+    # your scan, pick 3+ matching points, and feed them back as a correspondences file to pin it.
+    if not correspondences:
+        try:
+            pick_ply = os.path.join(sparse_out, "model_for_picking.ply")
+            _export_picking_ply(rec, pick_ply)
+            print(f"[picking] wrote SfM-frame model -> {pick_ply} (load in CloudCompare with your "
+                  f"scan to pick alignment points if auto-align misses)")
+        except Exception as e:
+            print(f"[picking] could not write picking PLY ({e})")
 
     # Georeferenced LiDAR (UTM / national grid) puts everything at million-metre coordinates. Work
     # the WHOLE pipeline in a local frame (absolute - origin): the bundle adjust stays well-
