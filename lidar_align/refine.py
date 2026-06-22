@@ -369,6 +369,7 @@ def refine(sparse_in, lidar, sparse_out,
     stage = _Stages(enabled=verbose)
     rec = colmap_io.load(sparse_in)
     print(f"loaded {rec.num_reg_images()} images, {rec.num_points3D()} points")
+    print(f"camera spread (as loaded, SfM frame): {_camera_spread(rec):.2f}")
     stage(f"loaded reconstruction ({rec.num_reg_images()} imgs, {rec.num_points3D():,} pts)")
 
     # A full reprojection BA over millions of points doesn't scale (the matrix factorization
@@ -445,6 +446,7 @@ def refine(sparse_in, lidar, sparse_out,
     import shutil
     guarding = bool(outer_iters)
     pre_spread = _camera_spread(rec)
+    print(f"camera spread (pre-aligned, before refine): {pre_spread:.2f} m")
     pre_med = _median_p2plane(rec, planes) if guarding else float("nan")
     snap = tempfile.mkdtemp(prefix="lidar_prealign_")
     try:
@@ -461,14 +463,16 @@ def refine(sparse_in, lidar, sparse_out,
         if guarding and pre_spread > 1e-6:
             post_spread = _camera_spread(rec)
             post_med = _median_p2plane(rec, planes)
-            collapsed = post_spread < 0.25 * pre_spread
-            # only keep the refine if it left the fit at least as good as the pre-align (within
-            # 10%); otherwise it did harm (collapse or drift) and the rigid pre-align is better.
+            # Keep the refine only if the cameras stayed put (spread within 30% of the pre-align)
+            # AND the fit didn't get worse. A free-gauge BA tends to shrink/drift the cameras even
+            # when the points stay on the planes, so a meaningful drop in spread = reject. (The old
+            # 0.25 threshold let a 4x collapse through right at the boundary.)
+            collapsed = post_spread < 0.70 * pre_spread or post_spread > 1.50 * pre_spread
             worse = (np.isfinite(pre_med) and np.isfinite(post_med)
                      and post_med > pre_med * 1.10 + 1e-4)
             if collapsed or worse:
-                why = (f"collapsed the cameras (spread {pre_spread:.1f} m -> {post_spread:.1f} m)"
-                       if collapsed else
+                why = (f"moved the cameras off the pre-align (spread {pre_spread:.2f} m -> "
+                       f"{post_spread:.2f} m)" if collapsed else
                        f"made the fit worse (median {pre_med*100:.1f} cm -> {post_med*100:.1f} cm)")
                 print(f"[WARNING] the refine {why} - reverting to the pre-aligned result (a clean "
                       f"rigid placement). Set 'Re-match rounds' = 0 to skip the refine next time.")
