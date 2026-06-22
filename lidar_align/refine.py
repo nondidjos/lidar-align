@@ -115,8 +115,15 @@ def _native_plane_cost(plane_pt, plane_n, weight, soft=100.0):
     smaller), so HuberLoss(hub*w) still robustifies at `hub` metres of point-to-plane distance.
     """
     n = np.asarray(plane_n, dtype=np.float64)
+    n = n / (np.linalg.norm(n) or 1.0)   # the projector identity below needs a UNIT normal; a
+                                         # non-unit n makes nn a scaled projector and the closed-form
+                                         # cov indefinite (silently wrong). Callers pass eigh normals
+                                         # (already unit); this just keeps the helper safe to reuse.
     nn = np.outer(n, n)
-    w2 = float(weight) ** 2
+    # weight<=0 means "no LiDAR pull". Clamp so the cov (which divides by w^2) can't ZeroDivision /
+    # blow up - a near-zero weight then just makes the tie negligible, matching the old Python cost
+    # which no-op'd at weight 0 (a user setting w_lidar=0 to disable LiDAR must not crash the refine).
+    w2 = max(float(weight), 1e-12) ** 2
     s2 = soft * soft
     # NormalPrior wants the COVARIANCE. info = w2*nn + (w2/s2)*(I-nn); since nn and (I-nn) are
     # complementary projectors, its inverse is closed-form - no per-tie np.linalg.inv (which, at
