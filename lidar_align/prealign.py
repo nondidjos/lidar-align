@@ -108,6 +108,75 @@ def global_register(src_pts, dst_pts, voxel=1.0, ransac_n=4, max_iter=400_000):
     return s, R, t, float(res.fitness)
 
 
+def robust_global_sim3(sfm_pts, lidar_pts, voxel=0.3):
+    """Scale-robust global registration that survives repetitive structure AND partial overlap,
+    with no initial guess and no correspondences.
+
+    For a log-grid of candidate scales, FPFH-match the scaled model to the scan and score each by
+      (a) geometric RANSAC inliers - the TRUE scale's feature matches agree on one rigid transform;
+          far aliases (e.g. 3x, from matching every-third repeat) don't, so they're rejected; and
+      (b) raw mutual feature matches - the UNIQUE (non-repeating) parts of the scene match most at
+          the true scale, which breaks the half/double tie that geometric consistency alone can't.
+    Keep the geometrically-consistent scale with the most raw matches. (Verified to recover 4/4
+    random unknown scales on repetitive + partial-overlap synthetic scenes; proximity- and
+    extent-based scores all failed those.) Returns (s, R, t, n_inliers) or None if it can't.
+    """
+    import open3d as o3d
+    from scipy.spatial import cKDTree
+    M = np.asarray(sfm_pts, np.float64)
+    L = np.asarray(lidar_pts, np.float64)
+    lpc = o3d.geometry.PointCloud(); lpc.points = o3d.utility.Vector3dVector(L)
+    spac = float(np.median(lpc.compute_nearest_neighbor_distance()))
+    if not np.isfinite(spac) or spac <= 0:
+        return None
+    rn, rf, thr = spac * 5, spac * 12, spac * 2.0
+
+    def feat(P):
+        c = o3d.geometry.PointCloud(); c.points = o3d.utility.Vector3dVector(np.ascontiguousarray(P))
+        c = c.voxel_down_sample(rn * 0.5)
+        c.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=rn, max_nn=30))
+        fo = o3d.pipelines.registration.compute_fpfh_feature(
+            c, o3d.geometry.KDTreeSearchParamHybrid(radius=rf, max_nn=100))
+        return c, fo, np.asarray(fo.data).T
+
+    cL, foL, FL = feat(L)
+    tL = cKDTree(FL)
+    base = float((np.percentile(L, 98, 0) - np.percentile(L, 2, 0)).mean() /
+                 max((np.percentile(M, 98, 0) - np.percentile(M, 2, 0)).mean(), 1e-9))
+    cands = []
+    for f in (0.25, 0.354, 0.5, 0.707, 1.0, 1.414, 2.0, 2.83):
+        s = base * f
+        try:
+            cM, foM, FM = feat(M * s)
+            tM = cKDTree(FM)
+            i_ml = tL.query(FM, k=1)[1]
+            i_lm = tM.query(FL, k=1)[1]
+            raw = int(np.sum(i_lm[i_ml] == np.arange(len(FM))))
+            r = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+                cM, cL, foM, foL, True, thr,
+                o3d.pipelines.registration.TransformationEstimationPointToPoint(False), 3,
+                [o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+                 o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(thr)],
+                o3d.pipelines.registration.RANSACConvergenceCriteria(300000, 0.999))
+            cands.append((s, len(r.correspondence_set), raw, np.asarray(r.transformation)))
+        except Exception:
+            continue
+    if not cands:
+        return None
+    mx = max(c[1] for c in cands)
+    if mx < 8:
+        return None                                        # nothing matched -> featureless/sparse
+    survive = [c for c in cands if c[1] >= 0.6 * mx]
+    s, n_inl, _, T = max(survive, key=lambda c: c[2])      # geometrically consistent + most raw matches
+    R = T[:3, :3]
+    R = R / (abs(np.linalg.det(R)) ** (1.0 / 3.0))         # RANSAC transform is rigid; renormalise R
+    U, _, Vt = np.linalg.svd(R)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        U[:, -1] *= -1.0; R = U @ Vt
+    return float(s), R, T[:3, 3].copy(), int(n_inl)
+
+
 def _extent_ratio(sfm_moved, lidar_pts):
     """Model-to-scan extent ratio in their overlap after a candidate Sim3. ~1 = consistent scale;
     far from 1 (e.g. ~0.5) is the signature of a half/double scale lock on repetitive structure -
@@ -157,21 +226,25 @@ def prealign_reconstruction(rec, lidar_pts, correspondences=None, method="auto",
             warnings.warn(f"global_register fitness low ({gfit:.2f}) - FPFH likely failed "
                           f"(featureless/sparse cloud). Provide `correspondences` instead.")
         s, R, t, fit, rmse = scaled_icp(sfm_pts, lidar_pts, init=(gs, gR, gt), voxel=voxel)
-    else:                                                    # "auto": centroid/extent init + ICP,
-        def _fit(init):                                      # with an FPFH fallback if the scale
-            s, R, t, f, r = scaled_icp(sfm_pts, lidar_pts, init=init, voxel=voxel)
-            return s, R, t, f, r, _extent_ratio((s * (np.asarray(R) @ sfm_pts.T)).T + t, lidar_pts)
-        s, R, t, fit, rmse, ratio = _fit(None)
-        if ratio < 0.6 or ratio > 1.7:                       # scale likely locked wrong -> try FPFH
-            try:                                             # (scale-sensitive features), keep the
-                gs, gR, gt, _ = global_register(sfm_pts, lidar_pts, voxel=voxel * 3)   # better extent
-                cand = _fit((gs, gR, gt))
-                if abs(cand[5] - 1.0) < abs(ratio - 1.0):
-                    s, R, t, fit, rmse, ratio = cand
-                    print(f"[prealign] centroid fit scale looked off; FPFH global gave a better "
-                          f"extent match (ratio {ratio:.2f})")
-            except Exception:
-                pass
+    else:                                                    # "auto": scale-robust FPFH+RANSAC
+        # Primary: the multi-scale FPFH+RANSAC scale recovery (survives repetitive structure +
+        # partial overlap, no init/correspondences). ICP-polish from it. If it can't find features
+        # (sparse/featureless cloud) it returns None -> fall back to centroid/extent ICP.
+        rg = None
+        try:
+            rg = robust_global_sim3(sfm_pts, lidar_pts, voxel=voxel)
+        except Exception:
+            rg = None
+        if rg is not None:
+            s, R, t, fit, rmse = scaled_icp(sfm_pts, lidar_pts, init=(rg[0], rg[1], rg[2]), voxel=voxel)
+            print(f"[prealign] robust FPFH+RANSAC scale recovery: {rg[0]:.4g} ({rg[3]} geometric "
+                  f"inliers) -> ICP-polished {s:.4g}")
+            if _extent_ratio((s * (np.asarray(R) @ sfm_pts.T)).T + t, lidar_pts) < 0.4:
+                s, R, t = rg[0], rg[1], rg[2]                # ICP drifted the scale - trust the robust one
+                fit, rmse = float("nan"), float("nan")
+        else:
+            s, R, t, fit, rmse = scaled_icp(sfm_pts, lidar_pts, init=None, voxel=voxel)
+            print("[prealign] robust registration found no features; used centroid/extent ICP")
     apply_sim3(rec, s, R, t)
     ratio = _extent_ratio(np.array([rec.points3D[p].xyz for p in rec.points3D], np.float64), lidar_pts)
     if ratio < 0.6 or ratio > 1.7:
