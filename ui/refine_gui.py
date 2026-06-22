@@ -236,10 +236,12 @@ def _find_gluemap():
     if shutil.which("wsl"):
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         try:
-            # login shell so ~/.local/bin (where the installer drops the wrapper) is on PATH
-            r = subprocess.run(["wsl", "bash", "-lc", "command -v gluemap-demo || command -v gluemap"],
+            # run as root (no Linux user/password); the installer drops the wrapper at
+            # /root/.local/bin/gluemap-demo - test that path directly so PATH config can't hide it.
+            r = subprocess.run(["wsl", "-u", "root", "bash", "-lc",
+                                'test -x "$HOME/.local/bin/gluemap-demo" || command -v gluemap-demo'],
                                capture_output=True, text=True, timeout=25, creationflags=flags)
-            if r.returncode == 0 and r.stdout.strip():
+            if r.returncode == 0:
                 return "wsl", "gluemap-demo"
         except Exception:
             pass
@@ -253,7 +255,8 @@ def _wsl_ready():
         return False
     try:
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        r = subprocess.run(["wsl", "-e", "true"], capture_output=True, timeout=20,
+        # as root: no Linux user/password needed, and it skips the first-run user-creation prompt.
+        r = subprocess.run(["wsl", "-u", "root", "-e", "true"], capture_output=True, timeout=20,
                            creationflags=flags)
         return r.returncode == 0
     except Exception:
@@ -803,9 +806,10 @@ class App:
                 self.q.put(("log", f"installer not found: {script}\n"))
                 return self.q.put(("done", 1))
             wsl_script = _winpath_to_wsl(script)
-            # strip CR (Windows checkout) and run under a WSL login shell
-            cmd = ["wsl", "bash", "-lc", 'tr -d "\\r" < "$1" | bash -ls', "_", wsl_script]
-            self.q.put(("log", f"$ wsl bash {wsl_script}\n\n"))
+            # run as root (no Linux user/password): the installer uses micromamba (no sudo), so root
+            # works and skips the Ubuntu first-run user-creation prompt. strip CR (Windows checkout).
+            cmd = ["wsl", "-u", "root", "bash", "-lc", 'tr -d "\\r" < "$1" | bash -ls', "_", wsl_script]
+            self.q.put(("log", f"$ wsl -u root bash {wsl_script}\n\n"))
             flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, bufsize=1, creationflags=flags)
@@ -961,10 +965,11 @@ class App:
             if a.get("engine") == "GLUEMAP":
                 os.makedirs(a["project"], exist_ok=True)   # gluemap won't create --write_path
                 if a.get("mode") == "wsl":
-                    # run inside WSL via a login shell (so the ~/.local/bin wrapper is on PATH);
-                    # translate Windows paths to /mnt/... . gluemap writes to the same on-disk
-                    # folder, so Step 2 reads the model back on the Windows side.
-                    inner = ('gluemap-demo --images_path "$1" --write_path "$2" '
+                    # run inside WSL as ROOT (no Linux user/password). Call the wrapper by FULL PATH
+                    # ($HOME/.local/bin = /root/.local/bin) so a non-login PATH can't hide it; $HOME
+                    # expands in the shell. gluemap writes to the same on-disk folder, so Step 2
+                    # reads the model back on the Windows side. Windows paths -> /mnt/... .
+                    inner = ('"$HOME/.local/bin/gluemap-demo" --images_path "$1" --write_path "$2" '
                              '--intrinsics_mode SHARED')
                     sh_args = ["_", _winpath_to_wsl(a["images"]), _winpath_to_wsl(a["project"])]
                     if a.get("config"):
@@ -972,12 +977,11 @@ class App:
                         sh_args.append(_winpath_to_wsl(a["config"]))
                     elif a.get("fisheye"):
                         # wide/action cam: use the OPENCV_FISHEYE preset the installer wrote (gluemap
-                        # defaults to SIMPLE_PINHOLE, which can't model a fisheye -> noise). $HOME
-                        # expands in the WSL login shell.
+                        # defaults to SIMPLE_PINHOLE, which can't model a fisheye -> noise).
                         inner += ' --config "$HOME/gluemap/configs/fisheye.yaml"'
                         self.q.put(("log", "[gluemap] fisheye camera: using OPENCV_FISHEYE preset "
                                            "(~/gluemap/configs/fisheye.yaml)\n"))
-                    cmd = ["wsl", "bash", "-lc", inner] + sh_args
+                    cmd = ["wsl", "-u", "root", "bash", "-lc", inner] + sh_args
                 else:
                     cmd = [a["gluemap"], "--images_path", a["images"],
                            "--write_path", a["project"], "--intrinsics_mode", "SHARED"]
