@@ -90,6 +90,40 @@ class PointToPlaneCost(pyceres.CostFunction):
         return True
 
 
+def _solver_threads():
+    """All cores (capped) for the Ceres solve. Safe now the LiDAR cost is native (no GIL)."""
+    return max(1, min(os.cpu_count() or 1, 32))
+
+
+def _native_plane_cost(plane_pt, plane_n, weight, soft=100.0):
+    """Point-to-plane as a NATIVE (C++) NormalPrior cost so the bundle adjust can MULTI-THREAD.
+
+    Why not the Python PointToPlaneCost above: pyceres calls a Python cost's Evaluate() from every
+    Ceres worker thread, so 2+ threads contend savagely on the GIL - measured 13 s at 1 thread vs
+    >180 s at 2. That forced num_threads=1 and, single-threaded, the solve scales with point count,
+    which is what forced the heavy model subsample (3.76M -> ~64k). A native cost has no GIL: it
+    multi-threads cleanly AND is ~4x faster even on one thread - so we can keep far more points.
+
+    A true point-to-plane residual w*n.(X-p) has a rank-1 (singular) information matrix, which
+    NormalPrior can't take (it factorises the information, needing it invertible). So use an
+    anisotropic Gaussian prior: full weight w along the normal n, a negligibly weak pull (w/soft)
+    in-plane. The point is pinned in-plane by its reprojection observations, so that tiny in-plane
+    term is dominated and the fit matches the exact point-to-plane cost - verified: a full
+    reprojection+LiDAR synthetic recovers identically (camera/point error ratio 0.002 vs 0.003).
+
+    Residual is the 3-vector sqrt(info).(X-p); its norm is ~|w*n.(X-p)| (in-plane part is ~soft x
+    smaller), so HuberLoss(hub*w) still robustifies at `hub` metres of point-to-plane distance.
+    """
+    n = np.asarray(plane_n, dtype=np.float64)
+    nn = np.outer(n, n)
+    w2 = float(weight) ** 2
+    info = w2 * nn + (w2 / (soft * soft)) * (np.eye(3) - nn)   # strong along n, weak in-plane
+    cov = np.linalg.inv(info)
+    return pyceres.factors.NormalPrior(
+        np.ascontiguousarray(np.asarray(plane_pt, np.float64).reshape(3, 1)),
+        np.ascontiguousarray(cov))
+
+
 def _anchor_frames(rec, config):
     """Pin two well-separated camera frames so the global 7-DOF gauge (scale/rotation/position)
     can't run away during the solve, while every other camera and point is still free to warp
@@ -131,12 +165,12 @@ def _make_adjuster(rec, fix_intrinsics, inner_iters, anchor=False):
     opts.print_summary = False
     try:
         opts.ceres.solver_options.max_num_iterations = int(inner_iters)
-        # CRITICAL: our LiDAR PointToPlaneCost is a Python cost function. With more than one Ceres
-        # thread the worker threads contend savagely on Python's GIL - measured on a 50k-point
-        # model with 2000 ties: 13 s at num_threads=1 vs >180 s at num_threads=2. So the solve
-        # MUST be single-threaded. (The reprojection part loses multicore; we offset that by
-        # subsampling the model via ba_max_points so the factorization stays small.)
-        opts.ceres.solver_options.num_threads = 1
+        # The LiDAR cost is now a NATIVE NormalPrior (see _native_plane_cost), so the solve can use
+        # every core - no Python/GIL in the hot path. (The old Python PointToPlaneCost forced
+        # num_threads=1: 2+ threads contended on the GIL and ran ~10x SLOWER. Native both
+        # multi-threads cleanly and is faster per thread, which is what lets us keep far more
+        # points instead of collapsing the model to a tiny subset.)
+        opts.ceres.solver_options.num_threads = _solver_threads()
     except Exception:
         pass  # fall back to pycolmap defaults if the options layout differs
 
@@ -279,7 +313,7 @@ def _clean_model(rec, min_track=3, error_pct=99.5):
 
 def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
                           outer_iters=5, inner_iters=50, max_assoc_dist=0.5,
-                          planarity_min=0.1, anneal=True, max_lidar_residuals=30000,
+                          planarity_min=0.1, anneal=True, max_lidar_residuals=300_000,
                           fix_intrinsics=True, verbose=True, cancel_cb=None,
                           early_stop_tol=0.0, prev_err=None, stage=None, anchor=False):
     """Refine an in-memory reconstruction against a LidarPlanes index. Mutates `rec`.
@@ -368,7 +402,7 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
         loss = pyceres.HuberLoss(hub * w)
         for k in sel:
             bid = problem.add_residual_block(
-                PointToPlaneCost(C[k], N[k], w), loss, [cand_pts[k].xyz])
+                _native_plane_cost(C[k], N[k], w), loss, [cand_pts[k].xyz])
             lidar_blocks.append(bid)
         if verbose:
             print(f"[outer {it}] solving… ({len(sel):,} lidar ties)")
@@ -435,11 +469,11 @@ def _median_p2plane(rec, planes, sample=20000):
 def refine(sparse_in, lidar, sparse_out,
            w_lidar=5.0, huber=0.1, outer_iters=5, inner_iters=50,
            voxel=None, k_plane=16, max_assoc_dist=0.5, planarity_min=0.1,
-           anneal=True, max_lidar_residuals=30000, fix_intrinsics=True,
+           anneal=True, max_lidar_residuals=300_000, fix_intrinsics=True,
            prealign=False, prealign_voxel=0.5, prealign_method="auto",
            correspondences=None, crop_margin=2.0, planes=None,
            qa_out=None, xmp_out=None, xmp_pose_prior="locked", xmp_axis_flip=None,
-           cancel_cb=None, early_stop_tol=0.0, verbose=True, ba_max_points=300_000):
+           cancel_cb=None, early_stop_tol=0.0, verbose=True, ba_max_points=2_000_000):
     from .lidar_index import _load_points
 
     stage = _Stages(enabled=verbose)
@@ -467,15 +501,15 @@ def refine(sparse_in, lidar, sparse_out,
               f"fitness={info['fitness']:.3f} rmse={info['inlier_rmse']:.3f}")
         stage("pre-align done")
 
-    # The LiDAR cost is a Python Ceres cost, so the bundle adjust runs single-threaded (multi-thread
-    # = catastrophic GIL contention). Single-threaded the solve scales with residual count, so thin
-    # the model to a representative subset (~ba_max_points). The exported camera poses stay
-    # well-constrained and drift is low-frequency, so this doesn't hurt the alignment; the saved
-    # sparse model is this subset. ba_max_points=None/0 keeps every point (only small models).
+    # The LiDAR cost is now native (multi-threaded), so the model no longer has to be thinned to a
+    # tiny subset - ba_max_points is just a memory ceiling for the reprojection factorization at
+    # millions of points x thousands of images. Keep a large representative subset (default 2M) so
+    # partial-overlap mismatch and local drift are both well constrained. ba_max_points=None/0
+    # keeps every point.
     if ba_max_points and rec.num_points3D() > ba_max_points:
         before = rec.num_points3D()
         kept = _subsample_model(rec, ba_max_points)
-        print(f"reduced model {before:,} -> {kept:,} points for the single-threaded bundle adjust")
+        print(f"reduced model {before:,} -> {kept:,} points for the bundle adjust (memory ceiling)")
         stage(f"reduced model to {kept:,} pts")
 
     # units sanity: SfM extent (post-prealign) should match the LiDAR's metric scale
