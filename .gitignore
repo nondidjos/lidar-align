@@ -32,3 +32,6 @@ config.yaml
 Thumbs.db
 .vscode/
 .idea/
+
+# local build log
+build_log.txt
