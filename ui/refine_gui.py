@@ -654,6 +654,15 @@ class App:
                        [("Vocab tree", "*.bin"), ("All", "*.*")],
                        tip="Optional COLMAP vocabulary-tree .bin file that lets it recognise when "
                            "the camera revisits the same place (loop closure). (COLMAP/GLOMAP only)")
+        self._combo(sf, 7, "Mapper (COLMAP)", "sfm_mapper",
+                    ["GLOMAP global (fast)", "Incremental (robust)"], "GLOMAP global (fast)",
+                    tip="How COLMAP turns matches into a model. GLOMAP global: fast, but on REPEATED "
+                        "structure (stairs, railings, balusters) or wide/fisheye lenses it can match "
+                        "the wrong repeats and fold the whole reconstruction into noise (the 'matrix "
+                        "not positive definite' warnings). Incremental: adds cameras one at a time "
+                        "with geometric verification - far more robust to repetition and fisheye, but "
+                        "slower. If your sparse cloud came out as unrecognizable noise, switch to "
+                        "Incremental and rebuild. (COLMAP/GLOMAP only)")
         self._path_row(sf, 6, "GLUEMAP config (optional)", "sfm_gluemap_config", "", "file",
                        [("YAML config", "*.yaml *.yml"), ("All", "*.*")],
                        tip="Optional YAML configuration file for GLUEMAP (e.g. configs/example.yaml). "
@@ -921,8 +930,10 @@ class App:
             quality=self.var["sfm_quality"].get(),
             vocab=self._abs(vocab_raw) if vocab_raw else "",
             colmap=self._colmap_exe,
+            mapper=self.var["sfm_mapper"].get(),
         )
-        self._start("running SfM (COLMAP + GLOMAP)…", self._sfm_worker, (args,))
+        kind = "incremental" if args["mapper"].startswith("Incremental") else "GLOMAP"
+        self._start(f"running SfM (COLMAP + {kind} mapper)…", self._sfm_worker, (args,))
 
     def _sfm_worker(self, a):
         def run(cmd, label):
@@ -1031,9 +1042,18 @@ class App:
                 self.q.put(("log", "view_graph_calibrator unavailable/failed - continuing; if "
                                    "global_mapper rejects many pairs, focal priors are the cause.\n"))
 
-            mapper = [a["colmap"], "global_mapper", "--database_path", a["db"],
-                      "--image_path", a["images"], "--output_path", a["sparse"]]
-            if not run(mapper, "global_mapper (GLOMAP)"):
+            os.makedirs(a["sparse"], exist_ok=True)
+            if a.get("mapper", "").startswith("Incremental"):
+                # Incremental SfM: registers cameras one at a time with geometric verification, so it
+                # rejects the wrong repeated-structure matches a global solve folds into noise.
+                mapper = [a["colmap"], "mapper", "--database_path", a["db"],
+                          "--image_path", a["images"], "--output_path", a["sparse"]]
+                label = "mapper (incremental, robust)"
+            else:
+                mapper = [a["colmap"], "global_mapper", "--database_path", a["db"],
+                          "--image_path", a["images"], "--output_path", a["sparse"]]
+                label = "global_mapper (GLOMAP)"
+            if not run(mapper, label):
                 return self.q.put(("done", 1))
 
             self.q.put(("log", f"\nSfM complete -> {os.path.join(a['sparse'], '0')}\n"))

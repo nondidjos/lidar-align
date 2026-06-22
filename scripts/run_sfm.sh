@@ -56,11 +56,22 @@ colmap sequential_matcher \
 echo "== view_graph_calibrator (focal priors) =="
 colmap view_graph_calibrator --database_path "$DB" || echo "view_graph_calibrator unavailable/failed - continuing"
 
-echo "== global_mapper (GLOMAP global SfM, built into COLMAP 4.x) =="
 mkdir -p "$WORK/sparse"
-colmap global_mapper \
-  --database_path "$DB" \
-  --image_path "$IMAGES" \
-  --output_path "$WORK/sparse"
+if [ "$METHOD" = "INCREMENTAL" ]; then
+  # Incremental SfM: registers cameras one at a time with geometric verification, so it rejects the
+  # wrong repeated-structure matches (stairs, railings) that fold a global solve into noise. Slower
+  # but far more robust on repetitive / wide-fisheye scenes.
+  echo "== mapper (COLMAP incremental SfM) =="
+  colmap mapper \
+    --database_path "$DB" \
+    --image_path "$IMAGES" \
+    --output_path "$WORK/sparse"
+else
+  echo "== global_mapper (GLOMAP global SfM, built into COLMAP 4.x) =="
+  colmap global_mapper \
+    --database_path "$DB" \
+    --image_path "$IMAGES" \
+    --output_path "$WORK/sparse"
+fi
 
 echo "SfM complete -> $WORK/sparse/0"
