@@ -46,6 +46,17 @@ run git submodule update --init --recursive
 echo "== building gluemap (pip install -e .) =="
 run bash -lc 'CMAKE_PREFIX_PATH=$CONDA_PREFIX pip install -e .'
 
+# 4b. wide/fisheye preset. gluemap defaults to camera_model: SIMPLE_PINHOLE, which cannot represent
+# a wide/action-cam lens (e.g. DJI Osmo Action ~155 deg) - the reconstruction comes out as noise.
+# This overrides ONLY the camera model; base.yaml supplies everything else. Sits next to base.yaml
+# so the relative `_base_:` resolves. The app passes it automatically for fisheye cameras.
+mkdir -p "$PREFIX/configs"
+cat > "$PREFIX/configs/fisheye.yaml" <<'EOF'
+_base_: base.yaml
+camera_model: OPENCV_FISHEYE
+EOF
+echo "wrote fisheye preset -> $PREFIX/configs/fisheye.yaml"
+
 # 5. model checkpoints
 echo "== downloading model checkpoints (several GB) =="
 mkdir -p checkpoints

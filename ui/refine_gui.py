@@ -905,6 +905,7 @@ class App:
                 engine="GLUEMAP", mode=mode, gluemap=gluemap_exe,
                 images=photos, sparse=p["sparse"], project=p["project"],
                 config=self._abs(cfg_raw) if cfg_raw else "",
+                fisheye=(_CAMERA_MODEL[self.var["camera"].get()] == "OPENCV_FISHEYE"),
             )
             self._start(f"running SfM (GLUEMAP via {mode})…", self._sfm_worker, (args,))
             return
@@ -969,12 +970,21 @@ class App:
                     if a.get("config"):
                         inner += ' --config "$3"'
                         sh_args.append(_winpath_to_wsl(a["config"]))
+                    elif a.get("fisheye"):
+                        # wide/action cam: use the OPENCV_FISHEYE preset the installer wrote (gluemap
+                        # defaults to SIMPLE_PINHOLE, which can't model a fisheye -> noise). $HOME
+                        # expands in the WSL login shell.
+                        inner += ' --config "$HOME/gluemap/configs/fisheye.yaml"'
+                        self.q.put(("log", "[gluemap] fisheye camera: using OPENCV_FISHEYE preset "
+                                           "(~/gluemap/configs/fisheye.yaml)\n"))
                     cmd = ["wsl", "bash", "-lc", inner] + sh_args
                 else:
                     cmd = [a["gluemap"], "--images_path", a["images"],
                            "--write_path", a["project"], "--intrinsics_mode", "SHARED"]
                     if a.get("config"):
                         cmd += ["--config", a["config"]]
+                    elif a.get("fisheye"):
+                        cmd += ["--config", os.path.expanduser("~/gluemap/configs/fisheye.yaml")]
                 if not run(cmd, f"gluemap ({a.get('mode')})"):
                     self.q.put(("log", "\nGLUEMAP run failed - see above for details.\n"))
                     return self.q.put(("done", 1))
