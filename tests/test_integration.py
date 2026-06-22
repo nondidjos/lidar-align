@@ -198,6 +198,14 @@ def test_georeferenced_recenter():
         offset = np.array([float(x) for x in last.split()[1:]])
         assert np.linalg.norm(offset) > 1e5, f"offset {offset} is not georeferenced-scale"
 
+        # a recentered LiDAR is written (matching pair -> no manual shifting) and is itself LOCAL
+        import laspy
+        ref = os.path.join(sparse_out, "lidar_reference_local.laz")
+        assert os.path.exists(ref), "recentered reference cloud not written"
+        rp = laspy.read(ref).xyz
+        assert np.abs(rp).max() < 1e4, f"reference cloud is not local: |coord|max={np.abs(rp).max():.0f}"
+        assert np.linalg.norm(rp.mean(0) + offset - UTM) < 50, "reference+offset != original UTM frame"
+
         name2id = {os.path.splitext(im.name)[0]: iid
                    for iid, im in rec.images.items() if im.has_pose}
         xmps = glob.glob(os.path.join(xmp_out, "**", "*.xmp"), recursive=True)

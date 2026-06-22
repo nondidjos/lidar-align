@@ -534,6 +534,24 @@ def _shift_rec(rec, origin):
                                  (-np.asarray(origin, np.float64))))
 
 
+def _write_reference_cloud(pts, path, log=print):
+    """Write the (local-frame) LiDAR the cameras were aligned to, as a LAZ, so it can be dropped
+    straight into RealityScan next to the cameras - already in the same frame, no manual shifting.
+    This is the cropped region the photos cover (the alignment reference)."""
+    import laspy
+    pts = np.ascontiguousarray(pts, np.float64)
+    if len(pts) == 0:
+        return False
+    h = laspy.LasHeader(point_format=3, version="1.4")
+    h.scales = [0.001, 0.001, 0.001]                      # 1 mm, survey grade
+    h.offsets = np.floor(pts.min(axis=0))
+    las = laspy.LasData(h)
+    las.x, las.y, las.z = pts[:, 0], pts[:, 1], pts[:, 2]
+    las.write(str(path))
+    log(f"[georef] wrote recentered LiDAR ({len(pts):,} pts) -> {path}")
+    return True
+
+
 def refine(sparse_in, lidar, sparse_out,
            w_lidar=5.0, huber=0.1, outer_iters=5, inner_iters=50,
            voxel=None, k_plane=16, max_assoc_dist=0.5, planarity_min=0.1,
@@ -724,20 +742,33 @@ def refine(sparse_in, lidar, sparse_out,
     print(f"wrote refined model -> {sparse_out}")
     stage("saved refined model")
 
-    # Record the georef offset so the local output can be put back on the survey datum.
+    # Georeferenced LiDAR: hand the user a matching pair so nothing is manual. Write the recentered
+    # scan (same local frame as the cameras) and record the offset for re-georeferencing later.
     if origin is not None:
+        ref_path = os.path.join(sparse_out, "lidar_reference_local.laz")
+        wrote_ref = False
+        if not cancelled:
+            try:
+                wrote_ref = _write_reference_cloud(planes.pts, ref_path)
+            except Exception as e:
+                print(f"[georef] could not write recentered LiDAR ({e}); use coordinate_offset.txt")
+        ref_note = (f"# A recentered copy of the LiDAR (this same local frame) is at\n"
+                    f"#   {os.path.basename(ref_path)} - import it into RealityScan next to the\n"
+                    f"# cameras and they line up with no manual steps.\n") if wrote_ref else ""
         msg = ("# lidar-align worked in a LOCAL frame because the LiDAR was georeferenced\n"
                "# (million-metre coords break RealityScan camera placement). local = absolute - offset.\n"
-               "# Shift your scan by -offset to line it up with the cameras in RealityScan, or add\n"
-               "# offset back to georeference the refined model.\n"
+               + ref_note +
+               "# Add offset back to put the refined model on the survey datum.\n"
                f"offset_xyz {origin[0]:.4f} {origin[1]:.4f} {origin[2]:.4f}\n")
         for d in (sparse_out, xmp_out):
             if d:
                 os.makedirs(d, exist_ok=True)
                 with open(os.path.join(d, "coordinate_offset.txt"), "w", encoding="utf-8") as f:
                     f.write(msg)
-        print(f"[georef] output is in a local frame (offset {np.round(origin, 2)}); wrote "
-              f"coordinate_offset.txt. Shift your scan by the same offset before importing into RS.")
+        if wrote_ref:
+            print(f"[georef] import {os.path.basename(ref_path)} into RealityScan next to the "
+                  f"cameras - same frame, no manual shifting. (offset {np.round(origin, 2)} saved "
+                  f"in coordinate_offset.txt to re-georeference later.)")
 
     if qa_out and not cancelled:
         from . import qa
