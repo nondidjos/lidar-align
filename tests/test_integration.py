@@ -151,11 +151,11 @@ def test_pipeline_end_to_end():
         shutil.rmtree(work, ignore_errors=True)
 
 
-def test_georeferenced_recenter():
-    """Georeferenced LiDAR (UTM) -> the aligned model lands at million-metre coords, which RS can't
-    place (cameras off-screen, scan auto-tilted). The pipeline must recenter the export to a local
-    origin, write coordinate_offset.txt, keep the .xmp positions small, and round-trip exactly:
-    local_camera_position + offset == the true georeferenced camera centre."""
+def test_georeferenced_accuracy():
+    """Georeferenced LiDAR (UTM): the pipeline must solve in a LOCAL frame (so the bundle adjust is
+    well-conditioned - at UTM it loses ~3 digits) but EXPORT in the LiDAR's georeferenced coordinates
+    so the .xmp poses land in the same frame as the user's scan (no extra files, no offset). Assert
+    the exported camera centres are georeferenced (UTM-scale) AND accurate to the true UTM poses."""
     from lidar_align.export_xmp import camera_pose, read_xmp_pose
     np.random.seed(0)
     work = tempfile.mkdtemp(prefix="lidar_align_geo_")
@@ -191,20 +191,9 @@ def test_georeferenced_recenter():
                    w_lidar=20.0, huber=0.2, outer_iters=12, inner_iters=30,
                    max_assoc_dist=0.5, planarity_min=0.05, anneal=True, xmp_out=xmp_out)
 
-        # offset file written next to BOTH the model and the xmp sidecars
-        for d in (sparse_out, xmp_out):
-            assert os.path.exists(os.path.join(d, "coordinate_offset.txt")), f"no offset file in {d}"
-        last = open(os.path.join(xmp_out, "coordinate_offset.txt")).read().strip().splitlines()[-1]
-        offset = np.array([float(x) for x in last.split()[1:]])
-        assert np.linalg.norm(offset) > 1e5, f"offset {offset} is not georeferenced-scale"
-
-        # a recentered LiDAR is written (matching pair -> no manual shifting) and is itself LOCAL
-        import laspy
-        ref = os.path.join(sparse_out, "lidar_reference_local.laz")
-        assert os.path.exists(ref), "recentered reference cloud not written"
-        rp = laspy.read(ref).xyz
-        assert np.abs(rp).max() < 1e4, f"reference cloud is not local: |coord|max={np.abs(rp).max():.0f}"
-        assert np.linalg.norm(rp.mean(0) + offset - UTM) < 50, "reference+offset != original UTM frame"
+        # no extra files - the user just uses their own scan as the reference
+        assert not os.path.exists(os.path.join(sparse_out, "coordinate_offset.txt"))
+        assert not glob.glob(os.path.join(sparse_out, "*.laz"))
 
         name2id = {os.path.splitext(im.name)[0]: iid
                    for iid, im in rec.images.items() if im.has_pose}
@@ -212,19 +201,19 @@ def test_georeferenced_recenter():
         errs = []
         for xf in xmps:
             _, C = read_xmp_pose(xf)
-            assert np.linalg.norm(C) < 1e4, f"xmp position not local: |C|={np.linalg.norm(C):.0f} m"
+            assert np.linalg.norm(C) > 1e5, f"xmp position not georeferenced: |C|={np.linalg.norm(C):.0f}"
             base = os.path.splitext(os.path.relpath(xf, xmp_out))[0].replace("\\", "/")
             iid = name2id.get(base, name2id.get(os.path.basename(base)))
             if iid is not None:
-                errs.append(np.linalg.norm((C + offset) - (truth_cam[iid] + UTM)))
+                errs.append(np.linalg.norm(C - (truth_cam[iid] + UTM)))   # exported == true UTM pose
         e = float(np.mean(errs))
-        assert e < 0.05, f"georeference round-trip error {e:.4f} m (local pos + offset != true UTM pose)"
-        print(f"GEOREF RECENTER: PASS  offset {offset.tolist()} (UTM-scale), {len(xmps)} xmp local, "
-              f"round-trip err {e * 100:.2f} cm")
+        assert e < 0.05, f"georeferenced camera error {e:.4f} m (UTM-frame export inaccurate)"
+        print(f"GEOREF ACCURACY: PASS  {len(xmps)} xmp in your scan's UTM frame, "
+              f"camera error {e * 100:.2f} cm (solved local, exported georeferenced)")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":
     test_pipeline_end_to_end()
-    test_georeferenced_recenter()
+    test_georeferenced_accuracy()
