@@ -1218,8 +1218,15 @@ class App:
                        if getattr(sys, "frozen", False)
                        else [sys.executable, os.path.abspath(__file__), "--align-tool",
                              scan, ply, out_json])
+                print(f"launching visual align tool:\n  {' '.join(cmd)}")
                 print("opening the 3D window… match the ORANGE model to the GRAY scan, ENTER to accept.")
-                rc = subprocess.run(cmd).returncode
+            # stream the tool's stdout into this log live (it has tons of logging; the frozen app
+            # is windowed so this is how you see it). Outside the redirect so lines flush as they come.
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1)
+            for line in proc.stdout:
+                self.q.put(("log", line))
+            rc = proc.wait()
             if rc == 0 and os.path.isfile(out_json):
                 self._manual_align = out_json
                 self.q.put(("log", f"\n[align] saved your placement -> {out_json}\n"

@@ -630,7 +630,11 @@ def refine(sparse_in, lidar, sparse_out,
         with open(manual_align, encoding="utf-8") as f:
             m = _json.load(f)
         apply_sim3(rec, float(m["scale"]), np.asarray(m["R"], np.float64), np.asarray(m["t"], np.float64))
-        print(f"[manual align] applied your visual placement: scale={float(m['scale']):.4g}")
+        lo_m, hi_m = _sfm_aabb(rec)
+        print(f"[manual align] applied your visual placement: scale={float(m['scale']):.4g}, "
+              f"t={np.round(np.asarray(m['t'], float), 2).tolist()}")
+        print(f"[manual align] model now spans {np.round(hi_m - lo_m, 2)} m, centred "
+              f"{np.round((lo_m + hi_m) / 2, 2)} (should match your scan)")
         prealign = False
 
     # Pre-align on the FULL cleaned cloud (more points = better FPFH coverage for scale recovery);
