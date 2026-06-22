@@ -571,16 +571,17 @@ class App:
                    tip="At each spot a small local surface is fit through this many nearest cloud "
                        "points to find its orientation. More = smoother, noise-robust surfaces; "
                        "fewer = follows fine detail.")
-        self._entry(li, 6, "Max matches per round", "max_lidar_residuals", "30000",
+        self._entry(li, 6, "Max matches per round", "max_lidar_residuals", "150000",
                     tip="Cap on how many point-to-cloud matches to use each round (spread evenly "
-                        "across the scene). Limits time and memory on huge models; a few thousand "
-                        "is enough to pin the alignment.")
-        self._entry(li, 7, "Max model points (BA)", "ba_max_points", "300000",
-                    tip="The alignment solver doesn't scale to millions of model points, so the "
-                        "model is reduced to this many (spread evenly) before solving. The camera "
-                        "poses you export stay well-constrained. Higher = more accurate but slower "
-                        "(~150k≈5min, 300k≈12min single-threaded); blank/0 keeps all points (only "
-                        "viable for small models). This thins the MODEL, not the reference cloud.")
+                        "across the scene, then topped up to this count). The solver is now "
+                        "multi-threaded, so more matches = more robust to partial overlap / "
+                        "mismatch at little extra cost. Lower it on a weak machine.")
+        self._entry(li, 7, "Max model points (BA)", "ba_max_points", "800000",
+                    tip="The model is reduced to this many points (spread evenly, then topped up to "
+                        "this count) before solving. The solver now multi-threads, so this can be "
+                        "large: 800k suits a 24-thread / 64 GB box. Higher = more accurate but "
+                        "slower and heavier; lower on a weak machine; blank/0 keeps every point "
+                        "(slow at millions). This thins the MODEL, not the reference cloud.")
 
         # Outputs
         out = ttk.Labelframe(parent, text="Outputs", padding=8)
@@ -1056,7 +1057,7 @@ class App:
             inner_iters=int(float(v["inner_iters"].get() or 50)),
             max_assoc_dist=float(v["max_assoc_dist"].get()),
             planarity_min=float(v["planarity_min"].get()),
-            max_lidar_residuals=int(float(v["max_lidar_residuals"].get() or 30000)),
+            max_lidar_residuals=int(float(v["max_lidar_residuals"].get() or 150000)),
             ba_max_points=(int(float(v["ba_max_points"].get())) if v["ba_max_points"].get().strip() else None),
             anneal=bool(v["anneal"].get()),
             fix_intrinsics=bool(v["fix_intrinsics"].get()),
