@@ -108,6 +108,22 @@ def global_register(src_pts, dst_pts, voxel=1.0, ransac_n=4, max_iter=400_000):
     return s, R, t, float(res.fitness)
 
 
+def _extent_ratio(sfm_moved, lidar_pts):
+    """Model-to-scan extent ratio in their overlap after a candidate Sim3. ~1 = consistent scale;
+    far from 1 (e.g. ~0.5) is the signature of a half/double scale lock on repetitive structure -
+    the one failure mode a point-cloud-only fit can't resolve. Used to pick between candidates and
+    to warn. Returns the ratio (1.0 when there's too little overlap to judge)."""
+    sfm = np.asarray(sfm_moved, np.float64)
+    lid = np.asarray(lidar_pts, np.float64)
+    lo, hi = lid.min(0), lid.max(0)
+    keep = np.all((sfm >= lo) & (sfm <= hi), axis=1)        # the model's footprint inside the scan
+    if keep.sum() < 50:
+        return 1.0
+    se = np.percentile(sfm[keep], 98, 0) - np.percentile(sfm[keep], 2, 0)
+    le = np.percentile(lid, 98, 0) - np.percentile(lid, 2, 0)
+    return float(np.median(np.maximum(se, 1e-9) / np.maximum(le, 1e-9)))
+
+
 def apply_sim3(rec, s, R, t):
     """Apply a Sim3 (x' = s R x + t) to a pycolmap reconstruction, in place."""
     import pycolmap
@@ -126,7 +142,6 @@ def prealign_reconstruction(rec, lidar_pts, correspondences=None, method="auto",
     """
     import pycolmap  # noqa: F401  (ensures Sim3d available downstream)
     sfm_pts = np.array([rec.points3D[p].xyz for p in rec.points3D], np.float64)
-    init = None
     if correspondences is not None and len(correspondences) > 0:
         corr = np.asarray(correspondences, np.float64)
         if corr.ndim == 3 and corr.shape[1:] == (2, 3):     # N pairs [[src],[dst]]
@@ -134,14 +149,35 @@ def prealign_reconstruction(rec, lidar_pts, correspondences=None, method="auto",
         else:                                                # (src_array, dst_array)
             src = np.asarray(correspondences[0], np.float64)
             dst = np.asarray(correspondences[1], np.float64)
-        init = umeyama_sim3(src, dst)
+        s, R, t, fit, rmse = scaled_icp(sfm_pts, lidar_pts, init=umeyama_sim3(src, dst), voxel=voxel)
     elif method == "global":
         gs, gR, gt, gfit = global_register(sfm_pts, lidar_pts, voxel=voxel * 3)
         if gfit < 0.3:
             import warnings
             warnings.warn(f"global_register fitness low ({gfit:.2f}) - FPFH likely failed "
                           f"(featureless/sparse cloud). Provide `correspondences` instead.")
-        init = (gs, gR, gt)
-    s, R, t, fit, rmse = scaled_icp(sfm_pts, lidar_pts, init=init, voxel=voxel)
+        s, R, t, fit, rmse = scaled_icp(sfm_pts, lidar_pts, init=(gs, gR, gt), voxel=voxel)
+    else:                                                    # "auto": centroid/extent init + ICP,
+        def _fit(init):                                      # with an FPFH fallback if the scale
+            s, R, t, f, r = scaled_icp(sfm_pts, lidar_pts, init=init, voxel=voxel)
+            return s, R, t, f, r, _extent_ratio((s * (np.asarray(R) @ sfm_pts.T)).T + t, lidar_pts)
+        s, R, t, fit, rmse, ratio = _fit(None)
+        if ratio < 0.6 or ratio > 1.7:                       # scale likely locked wrong -> try FPFH
+            try:                                             # (scale-sensitive features), keep the
+                gs, gR, gt, _ = global_register(sfm_pts, lidar_pts, voxel=voxel * 3)   # better extent
+                cand = _fit((gs, gR, gt))
+                if abs(cand[5] - 1.0) < abs(ratio - 1.0):
+                    s, R, t, fit, rmse, ratio = cand
+                    print(f"[prealign] centroid fit scale looked off; FPFH global gave a better "
+                          f"extent match (ratio {ratio:.2f})")
+            except Exception:
+                pass
     apply_sim3(rec, s, R, t)
-    return dict(scale=s, R=R, t=t, fitness=fit, inlier_rmse=rmse)
+    ratio = _extent_ratio(np.array([rec.points3D[p].xyz for p in rec.points3D], np.float64), lidar_pts)
+    if ratio < 0.6 or ratio > 1.7:
+        import warnings
+        warnings.warn(f"pre-align scale may be wrong: the model came out {ratio:.2f}x the scan's "
+                      f"extent in their overlap. On repetitive structure a point-cloud fit can lock "
+                      f"at a half/double scale. Try method='global' (FPFH) or give 3+ "
+                      f"correspondences / one known dimension to pin the scale.")
+    return dict(scale=s, R=R, t=t, fitness=fit, inlier_rmse=rmse, scale_ratio=ratio)

@@ -256,6 +256,27 @@ def _trim_outliers(rec, margin=3.0):
     return int((~keep).sum())
 
 
+def _clean_model(rec, min_track=3, error_pct=99.5):
+    """Drop unreliable SfM points before alignment, using COLMAP's own quality signals:
+      - short tracks: a point seen by < min_track cameras is poorly triangulated (weak/no
+        parallax) - this is where the wild far-outliers come from;
+      - the worst reprojection-error tail (above the error_pct percentile).
+    Then geometric far-outliers as a backstop. The pre-align scale and the QA are only as good as
+    the points fed in, so this is the sanity gate on the COLMAP cloud. Returns #deleted.
+    """
+    ids = np.array(list(rec.points3D.keys()), dtype=np.int64)
+    if len(ids) < 200:
+        return _trim_outliers(rec)
+    errs = np.array([rec.points3D[int(i)].error for i in ids], np.float64)
+    tls = np.array([rec.points3D[int(i)].track.length() for i in ids])
+    pos = errs > 0
+    err_thr = np.percentile(errs[pos], error_pct) if pos.any() else np.inf
+    bad = (tls < min_track) | (errs > err_thr)
+    for pid in ids[bad].tolist():
+        rec.delete_point3D(pid)
+    return int(bad.sum()) + _trim_outliers(rec)
+
+
 def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
                           outer_iters=5, inner_iters=50, max_assoc_dist=0.5,
                           planarity_min=0.1, anneal=True, max_lidar_residuals=30000,
@@ -425,11 +446,12 @@ def refine(sparse_in, lidar, sparse_out,
     rec = colmap_io.load(sparse_in)
     print(f"loaded {rec.num_reg_images()} images, {rec.num_points3D()} points")
     print(f"camera spread (as loaded, SfM frame): {_camera_spread(rec):.2f}")
-    # Drop far-outlier triangulations BEFORE anything else - they wreck the pre-align scale
-    # (a handful of stray points can make the whole model come out ~100x too small).
-    n_out = _trim_outliers(rec)
+    # Clean the cloud BEFORE anything else: short-track / high-error / far-outlier points are junk
+    # triangulations that wreck the pre-align scale (a handful can make the model ~100x too small).
+    n_out = _clean_model(rec)
     if n_out:
-        print(f"trimmed {n_out:,} far-outlier points (junk triangulations that skew the scale)")
+        print(f"cleaned {n_out:,} low-quality/outlier points (short tracks, high error, far flyers) "
+              f"-> {rec.num_points3D():,} kept for alignment")
     stage(f"loaded reconstruction ({rec.num_reg_images()} imgs, {rec.num_points3D():,} pts)")
 
     # A full reprojection BA over millions of points doesn't scale (the matrix factorization

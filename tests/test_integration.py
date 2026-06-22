@@ -118,10 +118,14 @@ def test_pipeline_end_to_end():
             qa_out=qa_out, xmp_out=xmp_out,
         )
 
-        # 6. reload the refined model FROM DISK and score against truth
+        # 6. reload the refined model FROM DISK and score against truth. The pipeline now cleans
+        #    low-quality/outlier points, so score only over the points that survived.
         ref = load_model(sparse_out)
+        have = set(ref.points3D.keys())
+        surviving = [p for p in ids if p in have]
+        assert len(surviving) > 0.5 * len(ids), f"cleaning removed too many points ({len(surviving)}/{len(ids)})"
         e_final = float(np.mean([
-            np.linalg.norm(np.array(ref.points3D[p].xyz, float) - truth[p]) for p in ids]))
+            np.linalg.norm(np.array(ref.points3D[p].xyz, float) - truth[p]) for p in surviving]))
         print(f"mean error  raw={e_raw:.4f} m  ->  refined={e_final:.4f} m  "
               f"(ratio {e_final / e_raw:.3f})")
 
