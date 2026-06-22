@@ -343,6 +343,19 @@ def _camera_spread(rec):
     return float(np.linalg.norm(hi - lo))
 
 
+def _median_p2plane(rec, planes, sample=20000):
+    """Median |point-to-plane| (metres) over a sample of model points - the scalar used to judge
+    whether the refine actually improved the alignment or made it worse."""
+    ids = list(rec.points3D.keys())
+    if not ids:
+        return float("nan")
+    idx = (np.random.default_rng(0).choice(len(ids), sample, replace=False)
+           if len(ids) > sample else np.arange(len(ids)))
+    X = np.array([rec.points3D[ids[i]].xyz for i in idx], np.float64)
+    _, _, d, _, _ = planes.query(X)
+    return float(np.median(np.abs(d)))
+
+
 def refine(sparse_in, lidar, sparse_out,
            w_lidar=5.0, huber=0.1, outer_iters=5, inner_iters=50,
            voxel=None, k_plane=16, max_assoc_dist=0.5, planarity_min=0.1,
@@ -430,10 +443,12 @@ def refine(sparse_in, lidar, sparse_out,
     # pre-align cannot do that, so its result is the safe floor.
     import tempfile
     import shutil
+    guarding = bool(outer_iters)
     pre_spread = _camera_spread(rec)
+    pre_med = _median_p2plane(rec, planes) if guarding else float("nan")
     snap = tempfile.mkdtemp(prefix="lidar_prealign_")
     try:
-        if outer_iters and pre_spread > 1e-6:
+        if guarding and pre_spread > 1e-6:
             colmap_io.save(rec, snap)
 
         refine_reconstruction(rec, planes, w_lidar=w_lidar, huber=huber,
@@ -443,13 +458,24 @@ def refine(sparse_in, lidar, sparse_out,
                               fix_intrinsics=fix_intrinsics, cancel_cb=cancel_cb,
                               early_stop_tol=early_stop_tol, verbose=verbose, stage=stage)
 
-        post_spread = _camera_spread(rec)
-        if outer_iters and pre_spread > 1e-6 and post_spread < 0.25 * pre_spread:
-            print(f"[WARNING] the refine collapsed the cameras (spread {pre_spread:.1f} m -> "
-                  f"{post_spread:.1f} m) - reverting to the pre-aligned result, which is a clean "
-                  f"rigid placement. (Set 'Re-match rounds' = 0 to skip the refine next time.)")
-            rec = colmap_io.load(snap)
-            stage("reverted to pre-align (refine diverged)")
+        if guarding and pre_spread > 1e-6:
+            post_spread = _camera_spread(rec)
+            post_med = _median_p2plane(rec, planes)
+            collapsed = post_spread < 0.25 * pre_spread
+            # only keep the refine if it left the fit at least as good as the pre-align (within
+            # 10%); otherwise it did harm (collapse or drift) and the rigid pre-align is better.
+            worse = (np.isfinite(pre_med) and np.isfinite(post_med)
+                     and post_med > pre_med * 1.10 + 1e-4)
+            if collapsed or worse:
+                why = (f"collapsed the cameras (spread {pre_spread:.1f} m -> {post_spread:.1f} m)"
+                       if collapsed else
+                       f"made the fit worse (median {pre_med*100:.1f} cm -> {post_med*100:.1f} cm)")
+                print(f"[WARNING] the refine {why} - reverting to the pre-aligned result (a clean "
+                      f"rigid placement). Set 'Re-match rounds' = 0 to skip the refine next time.")
+                rec = colmap_io.load(snap)
+                stage("reverted to pre-align (refine did not help)")
+            else:
+                print(f"refine kept: median fit {pre_med*100:.1f} cm -> {post_med*100:.1f} cm")
     finally:
         shutil.rmtree(snap, ignore_errors=True)
     print(f"camera spread: {_camera_spread(rec):.1f} m "
