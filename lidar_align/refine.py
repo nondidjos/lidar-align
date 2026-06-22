@@ -90,8 +90,38 @@ class PointToPlaneCost(pyceres.CostFunction):
         return True
 
 
-def _make_adjuster(rec, fix_intrinsics, inner_iters):
-    """A pycolmap CeresBundleAdjuster over all registered images + points, gauge unfixed."""
+def _anchor_frames(rec, config):
+    """Pin two well-separated camera frames so the global 7-DOF gauge (scale/rotation/position)
+    can't run away during the solve, while every other camera and point is still free to warp
+    onto the LiDAR (this is what fixes drift). Anchoring is only right once a pre-align has put
+    the model roughly in the LiDAR frame - the anchors then hold that frame. Returns #pinned.
+
+    Use camera pinning, NOT config.fix_gauge(THREE_POINTS): the latter crashes Ceres
+    (LossFunctionWrapper abort) with this pycolmap/pyceres. Pinning frame poses is the standard
+    constant-parameter-block mechanism and is stable.
+    """
+    ims = [im for im in rec.images.values() if im.has_pose]
+    if len(ims) < 2:
+        return 0
+    cen = np.array([(-np.asarray(im.cam_from_world().matrix(), float)[:3, :3].T
+                     @ np.asarray(im.cam_from_world().matrix(), float)[:3, 3]) for im in ims])
+    axis = int(np.argmax(np.ptp(cen, axis=0)))        # most-spread axis -> pick the extremes
+    pinned = 0
+    for k in (int(np.argmin(cen[:, axis])), int(np.argmax(cen[:, axis]))):
+        try:
+            config.set_constant_rig_from_world_pose(ims[k].frame_id)
+            pinned += 1
+        except Exception:
+            pass
+    return pinned
+
+
+def _make_adjuster(rec, fix_intrinsics, inner_iters, anchor=False):
+    """A pycolmap CeresBundleAdjuster over all registered images + points.
+
+    `anchor`: pin two cameras to fix the gauge (use after a pre-align) so a free-gauge solve
+    can't collapse the scale; otherwise leave the gauge UNSPECIFIED (the LiDAR ties are the only
+    datum - needed when there's no pre-align, e.g. the synthetic tests)."""
     opts = pycolmap.BundleAdjustmentOptions()
     opts.refine_focal_length = not fix_intrinsics
     opts.refine_principal_point = not fix_intrinsics
@@ -117,8 +147,12 @@ def _make_adjuster(rec, fix_intrinsics, inner_iters):
     # add_variable_point over every point. That loop was a redundant 3.7M-iteration Python
     # call that held the GIL (freezing the UI) and added minutes to the build, with zero
     # effect on the result (verified: the synth case recovers identically without it).
-    # LiDAR is the datum -> do not let BA pin the gauge to the arbitrary SfM frame.
-    config.fix_gauge(pycolmap.BundleAdjustmentGauge.UNSPECIFIED)
+    if anchor and _anchor_frames(rec, config) >= 2:
+        pass            # gauge fixed by the two pinned cameras; the rest warps onto the LiDAR
+    else:
+        # No pre-align -> the LiDAR ties are the only datum; leave the gauge free so they can
+        # set position/orientation/scale (and so a global similarity error is correctable).
+        config.fix_gauge(pycolmap.BundleAdjustmentGauge.UNSPECIFIED)
 
     return pycolmap.create_default_ceres_bundle_adjuster(opts, config, rec)
 
@@ -205,7 +239,7 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
                           outer_iters=5, inner_iters=50, max_assoc_dist=0.5,
                           planarity_min=0.1, anneal=True, max_lidar_residuals=30000,
                           fix_intrinsics=True, verbose=True, cancel_cb=None,
-                          early_stop_tol=0.0, prev_err=None, stage=None):
+                          early_stop_tol=0.0, prev_err=None, stage=None, anchor=False):
     """Refine an in-memory reconstruction against a LidarPlanes index. Mutates `rec`.
 
     Annealing (when `anneal`): early rounds use a loose association radius, soft robust
@@ -222,10 +256,10 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
     # reuse it every round - rebuilding it per round re-creates millions of residual blocks
     # outer_iters times. Each round we only swap the (<= cap) LiDAR point-to-plane blocks.
     _stage = stage if stage is not None else (lambda *a: None)
-    ba = _make_adjuster(rec, fix_intrinsics, inner_iters)
+    ba = _make_adjuster(rec, fix_intrinsics, inner_iters, anchor=anchor)
     problem = ba.problem
     lidar_blocks = []
-    _stage("built bundle adjuster")
+    _stage("built bundle adjuster" + (" (gauge anchored on 2 cameras)" if anchor else ""))
     # Cap the per-round nearest-plane query: a few thousand well-spread ties pin the gauge and
     # warp; querying every point each round is wasted k-NN + PCA work at 7k-image scale.
     cand_cap = max(8 * max_lidar_residuals, 200_000)
@@ -458,7 +492,8 @@ def refine(sparse_in, lidar, sparse_out,
                               max_assoc_dist=max_assoc_dist, planarity_min=planarity_min,
                               anneal=anneal, max_lidar_residuals=max_lidar_residuals,
                               fix_intrinsics=fix_intrinsics, cancel_cb=cancel_cb,
-                              early_stop_tol=early_stop_tol, verbose=verbose, stage=stage)
+                              early_stop_tol=early_stop_tol, verbose=verbose, stage=stage,
+                              anchor=bool(prealign))
 
         if guarding and pre_spread > 1e-6:
             post_spread = _camera_spread(rec)
