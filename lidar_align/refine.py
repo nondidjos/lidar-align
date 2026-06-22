@@ -117,8 +117,11 @@ def _native_plane_cost(plane_pt, plane_n, weight, soft=100.0):
     n = np.asarray(plane_n, dtype=np.float64)
     nn = np.outer(n, n)
     w2 = float(weight) ** 2
-    info = w2 * nn + (w2 / (soft * soft)) * (np.eye(3) - nn)   # strong along n, weak in-plane
-    cov = np.linalg.inv(info)
+    s2 = soft * soft
+    # NormalPrior wants the COVARIANCE. info = w2*nn + (w2/s2)*(I-nn); since nn and (I-nn) are
+    # complementary projectors, its inverse is closed-form - no per-tie np.linalg.inv (which, at
+    # hundreds of thousands of ties x many rounds, is real time): cov = (1/w2)*nn + (s2/w2)*(I-nn).
+    cov = (s2 / w2) * np.eye(3) + ((1.0 - s2) / w2) * nn
     return pyceres.factors.NormalPrior(
         np.ascontiguousarray(np.asarray(plane_pt, np.float64).reshape(3, 1)),
         np.ascontiguousarray(cov))
@@ -313,7 +316,7 @@ def _clean_model(rec, min_track=3, error_pct=99.5):
 
 def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
                           outer_iters=5, inner_iters=50, max_assoc_dist=0.5,
-                          planarity_min=0.1, anneal=True, max_lidar_residuals=300_000,
+                          planarity_min=0.1, anneal=True, max_lidar_residuals=80_000,
                           fix_intrinsics=True, verbose=True, cancel_cb=None,
                           early_stop_tol=0.0, prev_err=None, stage=None, anchor=False):
     """Refine an in-memory reconstruction against a LidarPlanes index. Mutates `rec`.
@@ -336,9 +339,12 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
     problem = ba.problem
     lidar_blocks = []
     _stage("built bundle adjuster" + (" (gauge anchored on 2 cameras)" if anchor else ""))
-    # Cap the per-round nearest-plane query: a few thousand well-spread ties pin the gauge and
-    # warp; querying every point each round is wasted k-NN + PCA work at 7k-image scale.
-    cand_cap = max(8 * max_lidar_residuals, 200_000)
+    # Candidate pool for the per-round nearest-plane query. We query this set's CURRENT positions
+    # every round (multithreaded KD-tree), gate it, then subsample to max_lidar_residuals ties. Keep
+    # ~3x the tie target as headroom for the gating, but cap it ABSOLUTELY: with a big tie target the
+    # old `8 * max_lidar_residuals` blew this up to millions of k-NN+PCA queries per round (minutes
+    # that look like a freeze). 800k is plenty to draw a well-distributed tie set from on a laptop.
+    cand_cap = min(max(3 * max_lidar_residuals, 200_000), 800_000)
     _cuda_check_once()
 
     # Reading every point's coordinates each round (world_points over millions of points) costs
@@ -469,11 +475,11 @@ def _median_p2plane(rec, planes, sample=20000):
 def refine(sparse_in, lidar, sparse_out,
            w_lidar=5.0, huber=0.1, outer_iters=5, inner_iters=50,
            voxel=None, k_plane=16, max_assoc_dist=0.5, planarity_min=0.1,
-           anneal=True, max_lidar_residuals=300_000, fix_intrinsics=True,
+           anneal=True, max_lidar_residuals=80_000, fix_intrinsics=True,
            prealign=False, prealign_voxel=0.5, prealign_method="auto",
            correspondences=None, crop_margin=2.0, planes=None,
            qa_out=None, xmp_out=None, xmp_pose_prior="locked", xmp_axis_flip=None,
-           cancel_cb=None, early_stop_tol=0.0, verbose=True, ba_max_points=2_000_000):
+           cancel_cb=None, early_stop_tol=0.0, verbose=True, ba_max_points=400_000):
     from .lidar_index import _load_points
 
     stage = _Stages(enabled=verbose)
@@ -502,10 +508,12 @@ def refine(sparse_in, lidar, sparse_out,
         stage("pre-align done")
 
     # The LiDAR cost is now native (multi-threaded), so the model no longer has to be thinned to a
-    # tiny subset - ba_max_points is just a memory ceiling for the reprojection factorization at
-    # millions of points x thousands of images. Keep a large representative subset (default 2M) so
-    # partial-overlap mismatch and local drift are both well constrained. ba_max_points=None/0
-    # keeps every point.
+    # tiny subset. But solve time still scales with point count (residuals x iterations) and the
+    # multi-thread speedup is only ~Ncores (a 4-core laptop, not a workstation) - so keep a modest,
+    # bounded subset (default 400k, ~2x the old single-threaded budget). With the reprojection BA
+    # now multi-threaded too, that still runs in <= the old single-threaded wall-clock while
+    # constraining partial-overlap mismatch and drift better. Raise ba_max_points on a bigger
+    # machine, or None/0 to keep every point (can be very slow / memory-heavy at scale).
     if ba_max_points and rec.num_points3D() > ba_max_points:
         before = rec.num_points3D()
         kept = _subsample_model(rec, ba_max_points)
