@@ -580,7 +580,8 @@ def refine(sparse_in, lidar, sparse_out,
            prealign=False, prealign_voxel=0.5, prealign_method="auto",
            correspondences=None, crop_margin=2.0, planes=None,
            qa_out=None, xmp_out=None, xmp_pose_prior="locked", xmp_axis_flip=None,
-           cancel_cb=None, early_stop_tol=0.0, verbose=True, ba_max_points=800_000):
+           cancel_cb=None, early_stop_tol=0.0, verbose=True, ba_max_points=800_000,
+           manual_align=None):
     from .lidar_index import _load_points, read_crs
 
     stage = _Stages(enabled=verbose)
@@ -618,6 +619,19 @@ def refine(sparse_in, lidar, sparse_out,
     # load and to the model, then written out so the result georeferences back.
     origin = None
     lidar_world_bbox = None        # the scan's NATIVE coordinate range (what RealityScan reads)
+
+    # Manual visual alignment (the "Align visually" slider tool) wins over auto: apply the user's
+    # similarity, then treat the model as already placed in the scan frame (the no-prealign path
+    # below handles the georef origin/peek). This is the reliable route for stairs / repeated
+    # structure where auto-scale can't lock.
+    if manual_align:
+        import json as _json
+        from .prealign import apply_sim3
+        with open(manual_align, encoding="utf-8") as f:
+            m = _json.load(f)
+        apply_sim3(rec, float(m["scale"]), np.asarray(m["R"], np.float64), np.asarray(m["t"], np.float64))
+        print(f"[manual align] applied your visual placement: scale={float(m['scale']):.4g}")
+        prealign = False
 
     # Pre-align on the FULL cleaned cloud (more points = better FPFH coverage for scale recovery);
     # we only thin the model AFTER, for the bundle adjustment.

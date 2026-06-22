@@ -478,6 +478,13 @@ class App:
              "Use this to try a different Axis convention in seconds when the cameras import "
              "mirrored or upside-down: change 'Axis convention' under Advanced, click this, re-import "
              "one image in RealityScan, repeat until it looks right.")
+        self.align_vis_btn = ttk.Button(bar, text="Align visually", command=self.align_visual_run)
+        self.align_vis_btn.pack(side="left", padx=(6, 0))
+        _Tip(self.align_vis_btn,
+             "When auto-align can't lock the scale (stairs / repeated structure + partial overlap), "
+             "open a 3D window to place it by hand: +/- to scale the orange model onto the gray scan, "
+             "WASD/RF to move, QE/ZX to rotate, drag-mouse to look, ENTER to accept. Then click "
+             "'2. Align to cloud' - it uses your placement and just polishes from there.")
         self.dedup_btn = ttk.Button(bar, text="Merge scans", command=self.dedup_run)
         self.dedup_btn.pack(side="left", padx=(6, 0))
         _Tip(self.dedup_btn,
@@ -1062,10 +1069,12 @@ class App:
         if corr_file:
             from lidar_align.refine import parse_correspondences
             correspondences = parse_correspondences(self._abs(corr_file))
+        manual = getattr(self, "_manual_align", None)
         kw = dict(
             sparse_in=p["sparse_in"], lidar=self._abs(lidar), sparse_out=p["sparse_out"],
             prealign=bool(v["prealign"].get()),
             correspondences=correspondences,
+            manual_align=(manual if manual and os.path.isfile(manual) else None),
             prealign_method=v["prealign_method"].get(),
             prealign_voxel=float(v["prealign_voxel"].get() or 0.5),
             voxel=(float(voxel) if voxel else None),
@@ -1173,6 +1182,53 @@ class App:
         except KeyboardInterrupt:
             self.q.put(("log", "\n[cancelled - no file written]\n"))
             self.q.put(("done", 1))
+        except Exception:
+            self.q.put(("log", "\n" + traceback.format_exc()))
+            self.q.put(("done", 1))
+
+    # ── Interactive visual alignment (scale/pose by hand) ────────────────────────
+    def align_visual_run(self):
+        if self._worker and self._worker.is_alive():
+            return messagebox.showwarning("Busy", "A job is already running.")
+        lidar = self.var["lidar"].get().strip()
+        if not lidar:
+            return messagebox.showerror("Invalid input", "Set the Reference cloud first.")
+        scan = self._abs(lidar)
+        if not os.path.isfile(scan):
+            return messagebox.showerror("Not found", f"Cloud file not found:\n{scan}")
+        sparse_in = self._paths()["sparse_in"]
+        if not self._has_model(sparse_in):
+            return messagebox.showerror("No model", "Build or set the model first (Step 1).")
+        self._start("opening the visual align window (exporting model, loading scan)…",
+                    self._align_visual_worker, (sparse_in, scan, self._paths()["sparse_out"]))
+
+    def _align_visual_worker(self, sparse_in, scan, sparse_out):
+        try:
+            import subprocess
+            from lidar_align import colmap_io
+            from lidar_align.refine import _clean_model, _export_picking_ply
+            with contextlib.redirect_stdout(_QueueWriter(self.q)):
+                os.makedirs(sparse_out, exist_ok=True)
+                ply = os.path.join(sparse_out, "model_for_picking.ply")
+                rec = colmap_io.load(sparse_in)
+                _clean_model(rec)
+                _export_picking_ply(rec, ply)
+                out_json = os.path.join(sparse_out, "manual_align.json")
+                cmd = ([sys.executable, "--align-tool", scan, ply, out_json]
+                       if getattr(sys, "frozen", False)
+                       else [sys.executable, os.path.abspath(__file__), "--align-tool",
+                             scan, ply, out_json])
+                print("opening the 3D window… match the ORANGE model to the GRAY scan, ENTER to accept.")
+                rc = subprocess.run(cmd).returncode
+            if rc == 0 and os.path.isfile(out_json):
+                self._manual_align = out_json
+                self.q.put(("log", f"\n[align] saved your placement -> {out_json}\n"
+                                   f"[align] now click '2. Align to cloud' - it uses this and just "
+                                   f"polishes from there.\n"))
+                self.q.put(("done", 0))
+            else:
+                self.q.put(("log", "\n[align] cancelled - no placement saved.\n"))
+                self.q.put(("done", 1))
         except Exception:
             self.q.put(("log", "\n" + traceback.format_exc()))
             self.q.put(("done", 1))
@@ -1448,6 +1504,9 @@ def _selftest():
 def main():
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
+    if "--align-tool" in sys.argv:                     # interactive scale/pose matcher subprocess
+        from lidar_align.align_tool import cli_main
+        sys.exit(cli_main(sys.argv))
     root = tk.Tk()
     try:
         root.call("tk", "scaling", 1.25)

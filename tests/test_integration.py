@@ -22,6 +22,7 @@ import os
 os.environ.setdefault("GLOG_minloglevel", "3")   # silence ceres/glog chatter
 
 import glob
+import json
 import shutil
 import sys
 import tempfile
@@ -214,6 +215,46 @@ def test_georeferenced_accuracy():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_manual_align_recovers():
+    """The visual 'Align visually' tool writes a Sim3 JSON; refine(manual_align=...) must apply it as
+    the pre-align (skipping auto) and the LiDAR refine polish to truth. This is the reliable route for
+    stairs / repeated structure where auto-scale can't lock the scale."""
+    from lidar_align.export_xmp import camera_pose
+    np.random.seed(0)
+    work = tempfile.mkdtemp(prefix="lidar_align_man_")
+    try:
+        opts = pycolmap.SyntheticDatasetOptions()
+        opts.num_rigs = 1; opts.num_cameras_per_rig = 1
+        opts.num_frames_per_rig = 10; opts.num_points3D = 300; opts.track_length = 10
+        rec = pycolmap.synthesize_dataset(opts)
+        ids = list(rec.points3D.keys())
+        truth = {p: np.array(rec.points3D[p].xyz, float) for p in ids}
+        truth_cam = {im.image_id: camera_pose(im)[1] for im in rec.images.values() if im.has_pose}
+        _write_las(os.path.join(work, "l.las"), _planar_lidar(np.array([truth[p] for p in ids])))
+
+        s, ang = 0.4, np.deg2rad(15)
+        q = np.array([0.0, 0.0, np.sin(ang / 2), np.cos(ang / 2)])
+        R = pycolmap.Rotation3d(q).matrix(); t = np.array([2.0, -1.0, 3.0])
+        rec.transform(Sim3d(s, Rotation3d(q), t))
+        si = os.path.join(work, "si"); os.makedirs(si); rec.write(si)
+        # inverse Sim3 (perturbed -> truth) is what the visual tool would have produced
+        man = {"scale": 1.0 / s, "R": R.T.tolist(), "t": (-(1.0 / s) * (R.T @ t)).tolist()}
+        mj = os.path.join(work, "m.json"); json.dump(man, open(mj, "w"))
+
+        run_refine(sparse_in=si, lidar=os.path.join(work, "l.las"),
+                   sparse_out=os.path.join(work, "so"), manual_align=mj, prealign=False,
+                   w_lidar=20.0, huber=0.2, outer_iters=10, inner_iters=30,
+                   max_assoc_dist=0.5, planarity_min=0.05)
+        ref = load_model(os.path.join(work, "so"))
+        e = float(np.mean([np.linalg.norm(camera_pose(im)[1] - truth_cam[im.image_id])
+                           for im in ref.images.values() if im.has_pose and im.image_id in truth_cam]))
+        assert e < 0.05, f"manual_align did not recover (camera err {e:.4f} m)"
+        print(f"MANUAL ALIGN: PASS  applied visual Sim3, refine polished to {e * 100:.2f} cm")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_pipeline_end_to_end()
     test_georeferenced_accuracy()
+    test_manual_align_recovers()
