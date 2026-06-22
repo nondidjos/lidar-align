@@ -483,38 +483,54 @@ def refine(sparse_in, lidar, sparse_out,
     print(f"camera spread (pre-aligned, before refine): {pre_spread:.2f} m")
     pre_med = _median_p2plane(rec, planes) if guarding else float("nan")
     snap = tempfile.mkdtemp(prefix="lidar_prealign_")
-    try:
-        if guarding and pre_spread > 1e-6:
-            colmap_io.save(rec, snap)
 
+    def _run_pass(anchor_on):
         refine_reconstruction(rec, planes, w_lidar=w_lidar, huber=huber,
                               outer_iters=outer_iters, inner_iters=inner_iters,
                               max_assoc_dist=max_assoc_dist, planarity_min=planarity_min,
                               anneal=anneal, max_lidar_residuals=max_lidar_residuals,
                               fix_intrinsics=fix_intrinsics, cancel_cb=cancel_cb,
                               early_stop_tol=early_stop_tol, verbose=verbose, stage=stage,
-                              anchor=bool(prealign))
+                              anchor=anchor_on)
+
+    def _bad():
+        ps = _camera_spread(rec)
+        pm = _median_p2plane(rec, planes)
+        collapsed = ps < 0.70 * pre_spread or ps > 1.50 * pre_spread
+        worse = np.isfinite(pre_med) and np.isfinite(pm) and pm > pre_med * 1.10 + 1e-4
+        return collapsed, worse, ps, pm
+
+    try:
+        if guarding and pre_spread > 1e-6:
+            colmap_io.save(rec, snap)
+
+        # Pass 1: free gauge. Corrects a residual global similarity AND drift when it converges
+        # (this is the best result, and what the synthetic tests exercise).
+        _run_pass(False)
 
         if guarding and pre_spread > 1e-6:
-            post_spread = _camera_spread(rec)
-            post_med = _median_p2plane(rec, planes)
-            # Keep the refine only if the cameras stayed put (spread within 30% of the pre-align)
-            # AND the fit didn't get worse. A free-gauge BA tends to shrink/drift the cameras even
-            # when the points stay on the planes, so a meaningful drop in spread = reject. (The old
-            # 0.25 threshold let a 4x collapse through right at the boundary.)
-            collapsed = post_spread < 0.70 * pre_spread or post_spread > 1.50 * pre_spread
-            worse = (np.isfinite(pre_med) and np.isfinite(post_med)
-                     and post_med > pre_med * 1.10 + 1e-4)
-            if collapsed or worse:
-                why = (f"moved the cameras off the pre-align (spread {pre_spread:.2f} m -> "
-                       f"{post_spread:.2f} m)" if collapsed else
-                       f"made the fit worse (median {pre_med*100:.1f} cm -> {post_med*100:.1f} cm)")
-                print(f"[WARNING] the refine {why} - reverting to the pre-aligned result (a clean "
-                      f"rigid placement). Set 'Re-match rounds' = 0 to skip the refine next time.")
+            collapsed, worse, ps, pm = _bad()
+            not_cancelled = cancel_cb is None or not cancel_cb()
+            if (collapsed or worse) and prealign and not_cancelled:
+                # The free-gauge pass diverged (typically a scale collapse at thousands of images).
+                # The pre-align already fixed the global frame, so retry with the gauge ANCHORED on
+                # two cameras: the LiDAR can then warp out the DRIFT without the scale running away.
+                print(f"[refine] free-gauge pass diverged (spread {pre_spread:.2f}->{ps:.2f} m, "
+                      f"median {pre_med*100:.1f}->{pm*100:.1f} cm) - retrying with the gauge "
+                      f"anchored on 2 cameras…")
                 rec = colmap_io.load(snap)
-                stage("reverted to pre-align (refine did not help)")
+                stage("retry refine: gauge anchored on 2 cameras")
+                _run_pass(True)
+                collapsed, worse, ps, pm = _bad()
+            if collapsed or worse:
+                print(f"[WARNING] refine still off (spread {ps:.2f} m, median {pm*100:.1f} cm) - "
+                      f"keeping the pre-aligned result (a clean rigid placement). Set 'Re-match "
+                      f"rounds' = 0 to skip the refine next time.")
+                rec = colmap_io.load(snap)
+                stage("reverted to pre-align")
             else:
-                print(f"refine kept: median fit {pre_med*100:.1f} cm -> {post_med*100:.1f} cm")
+                print(f"refine kept: median fit {pre_med*100:.1f} cm -> {pm*100:.1f} cm, "
+                      f"camera spread {ps:.1f} m")
     finally:
         shutil.rmtree(snap, ignore_errors=True)
     print(f"camera spread: {_camera_spread(rec):.1f} m "
