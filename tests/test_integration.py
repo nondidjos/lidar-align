@@ -151,5 +151,72 @@ def test_pipeline_end_to_end():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_georeferenced_recenter():
+    """Georeferenced LiDAR (UTM) -> the aligned model lands at million-metre coords, which RS can't
+    place (cameras off-screen, scan auto-tilted). The pipeline must recenter the export to a local
+    origin, write coordinate_offset.txt, keep the .xmp positions small, and round-trip exactly:
+    local_camera_position + offset == the true georeferenced camera centre."""
+    from lidar_align.export_xmp import camera_pose, read_xmp_pose
+    np.random.seed(0)
+    work = tempfile.mkdtemp(prefix="lidar_align_geo_")
+    try:
+        sparse_in = os.path.join(work, "sparse_in")
+        sparse_out = os.path.join(work, "sparse_refined")
+        xmp_out = os.path.join(work, "xmp")
+        lidar_las = os.path.join(work, "lidar.las")
+        UTM = np.array([500000.0, 4500000.0, 60.0])      # a realistic georeferenced origin
+
+        opts = pycolmap.SyntheticDatasetOptions()
+        opts.num_rigs = 1; opts.num_cameras_per_rig = 1
+        opts.num_frames_per_rig = 10; opts.num_points3D = 300; opts.track_length = 10
+        rec = pycolmap.synthesize_dataset(opts)
+        ids = list(rec.points3D.keys())
+        truth = {p: np.array(rec.points3D[p].xyz, float) for p in ids}
+        truth_cam = {iid: camera_pose(im)[1] for iid, im in rec.images.items() if im.has_pose}
+
+        # LiDAR sits in UTM; the SfM model is in its own small frame (as COLMAP would produce).
+        _write_las(lidar_las, _planar_lidar(np.array([truth[p] + UTM for p in ids])))
+        ang = np.deg2rad(2.0)
+        rec.transform(Sim3d(1.03, Rotation3d(np.array([0.0, 0.0, np.sin(ang / 2), np.cos(ang / 2)])),
+                            np.array([0.10, -0.08, 0.12])))
+        os.makedirs(sparse_in, exist_ok=True); rec.write(sparse_in)
+        perturbed = {p: np.array(rec.points3D[p].xyz, float) for p in ids}
+        rng = np.random.default_rng(1)
+        sample = ids[:: max(len(ids) // 12, 1)]
+        corr = [[perturbed[p].tolist(), (truth[p] + UTM + rng.normal(0, 0.02, 3)).tolist()]
+                for p in sample]
+
+        run_refine(sparse_in=sparse_in, lidar=lidar_las, sparse_out=sparse_out,
+                   prealign=True, prealign_method="auto", correspondences=corr,
+                   w_lidar=20.0, huber=0.2, outer_iters=12, inner_iters=30,
+                   max_assoc_dist=0.5, planarity_min=0.05, anneal=True, xmp_out=xmp_out)
+
+        # offset file written next to BOTH the model and the xmp sidecars
+        for d in (sparse_out, xmp_out):
+            assert os.path.exists(os.path.join(d, "coordinate_offset.txt")), f"no offset file in {d}"
+        last = open(os.path.join(xmp_out, "coordinate_offset.txt")).read().strip().splitlines()[-1]
+        offset = np.array([float(x) for x in last.split()[1:]])
+        assert np.linalg.norm(offset) > 1e5, f"offset {offset} is not georeferenced-scale"
+
+        name2id = {os.path.splitext(im.name)[0]: iid
+                   for iid, im in rec.images.items() if im.has_pose}
+        xmps = glob.glob(os.path.join(xmp_out, "**", "*.xmp"), recursive=True)
+        errs = []
+        for xf in xmps:
+            _, C = read_xmp_pose(xf)
+            assert np.linalg.norm(C) < 1e4, f"xmp position not local: |C|={np.linalg.norm(C):.0f} m"
+            base = os.path.splitext(os.path.relpath(xf, xmp_out))[0].replace("\\", "/")
+            iid = name2id.get(base, name2id.get(os.path.basename(base)))
+            if iid is not None:
+                errs.append(np.linalg.norm((C + offset) - (truth_cam[iid] + UTM)))
+        e = float(np.mean(errs))
+        assert e < 0.05, f"georeference round-trip error {e:.4f} m (local pos + offset != true UTM pose)"
+        print(f"GEOREF RECENTER: PASS  offset {offset.tolist()} (UTM-scale), {len(xmps)} xmp local, "
+              f"round-trip err {e * 100:.2f} cm")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_pipeline_end_to_end()
+    test_georeferenced_recenter()

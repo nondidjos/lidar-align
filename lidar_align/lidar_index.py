@@ -38,17 +38,24 @@ def _voxel(pts: np.ndarray, voxel: float) -> np.ndarray:
 
 
 def _load_points(path, voxel=None, crop_aabb=None, crop_margin=0.0, max_points=None,
-                 log=None, cancel_cb=None):
+                 log=None, cancel_cb=None, origin=None):
+    """`origin`: subtract this (whole-metre) vector from every returned point so a georeferenced
+    cloud (UTM / national grid) is loaded in a small LOCAL frame - the bundle adjust is then
+    well-conditioned (Jacobians don't carry million-metre magnitudes). `crop_aabb` is given in the
+    LOCAL frame; cropping still happens in absolute coords while streaming (origin is added back to
+    the crop box), so the out-of-core RAM bound is preserved. origin=None loads in absolute coords.
+    """
     path = str(path)
     ext = os.path.splitext(path)[1].lower()
     _log = log or (lambda *a: None)                       # progress sink (GUI/stdout) or no-op
     def _stop():                                          # cooperative cancel between chunks/scans
         if cancel_cb is not None and cancel_cb():
             raise KeyboardInterrupt("cancelled while reading cloud")
+    o = np.asarray(origin, np.float64) if origin is not None else np.zeros(3)
     lo = hi = None
     if crop_aabb is not None:
-        lo = np.asarray(crop_aabb[0], np.float64) - crop_margin
-        hi = np.asarray(crop_aabb[1], np.float64) + crop_margin
+        lo = np.asarray(crop_aabb[0], np.float64) + o - crop_margin   # crop in ABSOLUTE coords
+        hi = np.asarray(crop_aabb[1], np.float64) + o + crop_margin
 
     if ext in (".las", ".laz"):
         import laspy
@@ -134,6 +141,8 @@ def _load_points(path, voxel=None, crop_aabb=None, crop_margin=0.0, max_points=N
     if max_points and len(pts) > max_points:
         sel = np.random.default_rng(0).choice(len(pts), max_points, replace=False)
         pts = pts[sel]
+    if origin is not None and len(pts):
+        pts = pts - o                                     # absolute -> local (small) frame
     return np.ascontiguousarray(pts, np.float64)
 
 
@@ -199,10 +208,10 @@ class LidarPlanes:
 
     @classmethod
     def from_file(cls, path, voxel=None, crop_aabb=None, crop_margin=2.0,
-                  k_plane=16, max_points=None, log=None, cancel_cb=None):
+                  k_plane=16, max_points=None, log=None, cancel_cb=None, origin=None):
         pts = _load_points(path, voxel=voxel, crop_aabb=crop_aabb,
                            crop_margin=crop_margin, max_points=max_points,
-                           log=log, cancel_cb=cancel_cb)
+                           log=log, cancel_cb=cancel_cb, origin=origin)
         (log or (lambda *a: None))(f"building KD-tree over {len(pts):,} points…\n")
         return cls(pts, k_plane=k_plane)
 

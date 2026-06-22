@@ -511,6 +511,29 @@ def _median_p2plane(rec, planes, sample=20000):
     return float(np.median(np.abs(d)))
 
 
+def _origin_for(pts, threshold=1e4):
+    """Whole-metre LOCAL origin for a (possibly georeferenced) cloud, or None if it already sits
+    near the coordinate origin. Georeferenced LiDAR (UTM / national grid) puts the scene at
+    million-metre coordinates; running the whole pipeline at `absolute - origin` keeps the bundle
+    adjust well-conditioned (Jacobians don't carry huge magnitudes - solving at UTM loses ~3
+    digits) AND lets RealityScan place the cameras (it can't at million-metre coords - they render
+    off-screen and it auto-tilts the scan). The offset is recorded so the result georeferences back:
+    absolute = local + origin."""
+    P = np.asarray(pts, np.float64)
+    if len(P) == 0:
+        return None
+    ctr = P.mean(axis=0)
+    if np.linalg.norm(ctr) < threshold:
+        return None
+    return np.round(ctr)
+
+
+def _shift_rec(rec, origin):
+    """Translate a reconstruction (points + camera poses) by -origin, in place."""
+    rec.transform(pycolmap.Sim3d(1.0, pycolmap.Rotation3d(np.array([0.0, 0.0, 0.0, 1.0])),
+                                 (-np.asarray(origin, np.float64))))
+
+
 def refine(sparse_in, lidar, sparse_out,
            w_lidar=5.0, huber=0.1, outer_iters=5, inner_iters=50,
            voxel=None, k_plane=16, max_assoc_dist=0.5, planarity_min=0.1,
@@ -533,6 +556,13 @@ def refine(sparse_in, lidar, sparse_out,
               f"-> {rec.num_points3D():,} kept for alignment")
     stage(f"loaded reconstruction ({rec.num_reg_images()} imgs, {rec.num_points3D():,} pts)")
 
+    # Georeferenced LiDAR (UTM / national grid) puts everything at million-metre coordinates. Work
+    # the WHOLE pipeline in a local frame (absolute - origin): the bundle adjust stays well-
+    # conditioned (solving at UTM loses ~3 digits) and the exported cameras land at small coords so
+    # RealityScan can place them. `origin` is found from the cloud once and applied to the LiDAR at
+    # load and to the model, then written out so the result georeferences back.
+    origin = None
+
     # Pre-align on the FULL cleaned cloud (more points = better FPFH coverage for scale recovery);
     # we only thin the model AFTER, for the bundle adjustment.
     if prealign:
@@ -540,11 +570,30 @@ def refine(sparse_in, lidar, sparse_out,
         print(f"pre-align: loading coarse cloud ({prealign_voxel} m voxel)…")
         coarse = _load_points(lidar, voxel=prealign_voxel,
                               log=(print if verbose else None), cancel_cb=cancel_cb)
+        origin = _origin_for(coarse)
+        if origin is not None:
+            coarse = coarse - origin                       # pre-align onto the LOCAL cloud
+            if correspondences:                            # targets are in the LiDAR frame -> shift too
+                correspondences = [[s, (np.asarray(t, float) - origin).tolist()]
+                                   for s, t in correspondences]
+            print(f"[georef] LiDAR is georeferenced; working in a local frame (origin "
+                  f"{np.round(origin, 2)}). Output will be recentered + an offset recorded.")
         info = prealign_reconstruction(rec, coarse, correspondences=correspondences,
                                        method=prealign_method, voxel=prealign_voxel)
         print(f"prealign[{prealign_method}]: scale={info['scale']:.4f} "
               f"fitness={info['fitness']:.3f} rmse={info['inlier_rmse']:.3f}")
         stage("pre-align done")
+    else:
+        # No pre-align: the model is assumed already in the LiDAR frame. Peek the cloud cheaply to
+        # find the georef origin, then bring that already-aligned (UTM) model into the local frame.
+        peek = _load_points(lidar, voxel=max(prealign_voxel, 1.0), max_points=300_000,
+                            log=(print if verbose else None), cancel_cb=cancel_cb)
+        origin = _origin_for(peek)
+        del peek
+        if origin is not None:
+            _shift_rec(rec, origin)
+            print(f"[georef] LiDAR is georeferenced; working in a local frame (origin "
+                  f"{np.round(origin, 2)}).")
 
     # The LiDAR cost is now native (multi-threaded), so the model no longer has to be thinned to a
     # tiny subset. Solve time still scales with point count (residuals x iterations), but with the
@@ -569,7 +618,8 @@ def refine(sparse_in, lidar, sparse_out,
         print("building plane index: loading cloud, voxel-merging, KD-tree…")
         planes = LidarPlanes.from_file(lidar, voxel=voxel, crop_aabb=(lo, hi),
                                        crop_margin=crop_margin, k_plane=k_plane,
-                                       log=(print if verbose else None), cancel_cb=cancel_cb)
+                                       log=(print if verbose else None), cancel_cb=cancel_cb,
+                                       origin=origin)
     print(f"lidar index: {planes.pts.shape[0]:,} points (cropped to SfM volume)")
     stage(f"built lidar index ({planes.pts.shape[0]:,} cloud pts)")
 
@@ -665,12 +715,29 @@ def refine(sparse_in, lidar, sparse_out,
     print(f"camera spread: {_camera_spread(rec):.1f} m "
           f"({'OK' if _camera_spread(rec) > 1.0 else 'COLLAPSED - check the cloud/ties'})")
 
-    # Always save what we have (a stopped run still leaves a partially-aligned model), but skip
-    # the slow QA plane-query and XMP export on cancel so Stop returns promptly.
+    # Skip the slow QA plane-query and XMP export on cancel so Stop returns promptly.
     cancelled = cancel_cb is not None and cancel_cb()
+
+    # Everything has been in the LOCAL frame since load (model + planes share it), so save/QA/XMP
+    # are all consistent. Always save what we have (a stopped run still leaves a partial model).
     colmap_io.save(rec, sparse_out)
     print(f"wrote refined model -> {sparse_out}")
     stage("saved refined model")
+
+    # Record the georef offset so the local output can be put back on the survey datum.
+    if origin is not None:
+        msg = ("# lidar-align worked in a LOCAL frame because the LiDAR was georeferenced\n"
+               "# (million-metre coords break RealityScan camera placement). local = absolute - offset.\n"
+               "# Shift your scan by -offset to line it up with the cameras in RealityScan, or add\n"
+               "# offset back to georeference the refined model.\n"
+               f"offset_xyz {origin[0]:.4f} {origin[1]:.4f} {origin[2]:.4f}\n")
+        for d in (sparse_out, xmp_out):
+            if d:
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "coordinate_offset.txt"), "w", encoding="utf-8") as f:
+                    f.write(msg)
+        print(f"[georef] output is in a local frame (offset {np.round(origin, 2)}); wrote "
+              f"coordinate_offset.txt. Shift your scan by the same offset before importing into RS.")
 
     if qa_out and not cancelled:
         from . import qa
