@@ -236,12 +236,14 @@ def prealign_reconstruction(rec, lidar_pts, correspondences=None, method="auto",
         except Exception:
             rg = None
         if rg is not None:
-            s, R, t, fit, rmse = scaled_icp(sfm_pts, lidar_pts, init=(rg[0], rg[1], rg[2]), voxel=voxel)
+            try:                                             # ICP-polish can throw (SVD non-converge)
+                s, R, t, fit, rmse = scaled_icp(sfm_pts, lidar_pts, init=(rg[0], rg[1], rg[2]), voxel=voxel)
+                if _extent_ratio((s * (np.asarray(R) @ sfm_pts.T)).T + t, lidar_pts) < 0.4:
+                    raise RuntimeError("ICP drifted the scale")
+            except Exception:
+                s, R, t, fit, rmse = rg[0], rg[1], rg[2], float("nan"), float("nan")  # trust robust
             print(f"[prealign] robust FPFH+RANSAC scale recovery: {rg[0]:.4g} ({rg[3]} geometric "
-                  f"inliers) -> ICP-polished {s:.4g}")
-            if _extent_ratio((s * (np.asarray(R) @ sfm_pts.T)).T + t, lidar_pts) < 0.4:
-                s, R, t = rg[0], rg[1], rg[2]                # ICP drifted the scale - trust the robust one
-                fit, rmse = float("nan"), float("nan")
+                  f"inliers) -> scale {s:.4g}")
         else:
             s, R, t, fit, rmse = scaled_icp(sfm_pts, lidar_pts, init=None, voxel=voxel)
             print("[prealign] robust registration found no features; used centroid/extent ICP")
