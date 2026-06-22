@@ -20,6 +20,37 @@ from scipy.spatial import cKDTree
 _E57_CHUNK = 5_000_000   # points per e57 read() block; bounds RAM on billion-point scans
 
 
+def read_crs(path):
+    """Return the coordinate reference system string a georeferenced cloud carries, or None.
+
+    e57 stores it in the file-root `coordinateMetadata` field (a String, usually WKT or an EPSG
+    reference - e.g. Belgian Lambert 72 = EPSG:31370); many scanners write it, some don't. LAS/LAZ
+    keep the CRS in VLRs/EVLRs (WKT or GeoTIFF keys). We surface it so the run can log which system
+    the output is in and write a .prj - RealityScan still reads the same field from your scan on a
+    georeferenced import, so this is for confirmation/convenience, not a transform."""
+    p = str(path)
+    ext = os.path.splitext(p)[1].lower()
+    try:
+        if ext == ".e57":
+            import pye57
+            root = pye57.E57(p).root
+            if root.isDefined("coordinateMetadata"):
+                v = (root.get("coordinateMetadata").value() or "").strip()
+                return v or None
+        elif ext in (".las", ".laz"):
+            import laspy
+            with laspy.open(p) as f:
+                for vlr in list(f.header.vlrs) + list(getattr(f.header, "evlrs", []) or []):
+                    s = getattr(vlr, "string", None) or getattr(vlr, "record_data_bytes", None)
+                    if isinstance(s, bytes):
+                        s = s.decode("ascii", "ignore")
+                    if s and ("PROJCS" in s or "PROJCRS" in s or "GEOGCS" in s):
+                        return s.strip()
+    except Exception:
+        return None
+    return None
+
+
 def _voxel(pts: np.ndarray, voxel: float) -> np.ndarray:
     """Keep one point per voxel (first seen)."""
     if not voxel or voxel <= 0 or len(pts) == 0:

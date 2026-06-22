@@ -542,9 +542,13 @@ def refine(sparse_in, lidar, sparse_out,
            correspondences=None, crop_margin=2.0, planes=None,
            qa_out=None, xmp_out=None, xmp_pose_prior="locked", xmp_axis_flip=None,
            cancel_cb=None, early_stop_tol=0.0, verbose=True, ba_max_points=800_000):
-    from .lidar_index import _load_points
+    from .lidar_index import _load_points, read_crs
 
     stage = _Stages(enabled=verbose)
+    lidar_crs = read_crs(lidar)            # CRS the scan carries (e.g. EPSG:31370 Belgian Lambert 72)
+    if lidar_crs:
+        print(f"[georef] LiDAR coordinate system (from the scan): {lidar_crs[:140]}"
+              f"{'…' if len(lidar_crs) > 140 else ''}")
     rec = colmap_io.load(sparse_in)
     print(f"loaded {rec.num_reg_images()} images, {rec.num_points3D()} points")
     print(f"camera spread (as loaded, SfM frame): {_camera_spread(rec):.2f}")
@@ -740,6 +744,15 @@ def refine(sparse_in, lidar, sparse_out,
     colmap_io.save(rec, sparse_out)
     print(f"wrote refined model -> {sparse_out}")
     stage("saved refined model")
+
+    # Drop the scan's CRS next to the output so you have the exact system to confirm in RealityScan
+    # (RS also reads it straight from your georeferenced scan on import).
+    if lidar_crs:
+        for d in (sparse_out, xmp_out):
+            if d:
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "coordinate_system.prj"), "w", encoding="utf-8") as f:
+                    f.write(lidar_crs)
 
     if xmp_out and not cancelled:
         from .export_xmp import export_xmp
