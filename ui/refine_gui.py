@@ -331,6 +331,13 @@ class App:
                 data = json.load(f)
         except Exception:
             return
+        # Migrate stale single-threaded-era defaults: if a value is still the OLD default (i.e. the
+        # user never changed it), adopt the new, larger one so existing configs get the multithreaded
+        # point/tie budget instead of being pinned to caps that starve the LiDAR fit.
+        for k, (old, new) in {"max_lidar_residuals": ("30000", "150000"),
+                              "ba_max_points": ("300000", "800000")}.items():
+            if str(data.get(k, "")).strip() == old:
+                data[k] = new
         for k, val in data.items():
             if k in self.var:
                 try:

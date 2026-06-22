@@ -616,6 +616,17 @@ def refine(sparse_in, lidar, sparse_out,
     print(f"SfM extent (post-prealign): {np.round(hi - lo, 2)} units "
           f"-> metric params (assoc/crop in same units)")
 
+    # Survey scans (e.g. Leica terrestrial) are mm-spacing - far denser than plane fitting needs
+    # (the real run cropped to ~960M points / 49 GB!). With no spacing set on a real-scale scene,
+    # auto-voxel to 2 cm: it strips intra-surface over-density (NOT detail - a local plane fit is
+    # identical at 2 cm) so the KD-tree, RAM and per-round queries shrink ~10-50x with no effect on
+    # the alignment. A scan already coarser than 2 cm is unchanged. The >5 m extent gate keeps it off
+    # the tiny synthetic test clouds (cm-sized patches). Set 'Cloud spacing' to override (finer/off).
+    if voxel is None and float(np.max(hi - lo)) > 5.0:
+        voxel = 0.02
+        print(f"[lidar] no cloud spacing set; auto-voxel to {voxel:g} m (keeps cm-scale planes, "
+              f"cuts RAM/time on dense survey scans). Set 'Cloud spacing' to override.")
+
     if planes is None:
         # This load + voxel + KD-tree build is the longest silent stage on a big raw cloud;
         # stream progress and honour Stop so it isn't a multi-hour black hole.
