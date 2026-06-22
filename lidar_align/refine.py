@@ -213,10 +213,11 @@ def _cuda_check_once():
 
 
 def _spatial_subsample(X, plan, idx, cap):
-    """Pick <= cap of the kept indices, spatially even (one per voxel) and favouring the
-    most-planar association per voxel. You don't need a residual on every point - a few
-    thousand well-distributed planar ties pin the 7-DOF gauge and the warp just as well,
-    and it keeps the (Python) LiDAR cost from dominating at 7k-image / million-point scale."""
+    """Pick <= cap of the kept indices: one most-planar tie per voxel for even coverage, then top up
+    with the next-most-planar ties to actually REACH `cap`. The voxel base alone returns only
+    ~#occupied voxels (~tens of thousands for a surface cloud regardless of cap), which starved the
+    LiDAR association - denser ties make the fit far more robust to partial overlap / mismatch, and
+    the native cost multi-threads so we can afford them."""
     if cap is None or len(idx) <= cap:
         return idx
     pts = X[idx]
@@ -237,7 +238,13 @@ def _spatial_subsample(X, plan, idx, cap):
         _, first = np.unique(packed, return_index=True)
     else:
         _, first = np.unique(ki, axis=0, return_index=True)
-    return idx[order[first]]
+    picked = order[first]                          # most-planar tie per occupied voxel (even base)
+    if len(picked) < cap:                          # surface cloud under-fills -> top up with the
+        chosen = np.zeros(len(idx), dtype=bool)    # next-most-planar unpicked ties (order is sorted)
+        chosen[picked] = True
+        extra = order[~chosen[order]]
+        picked = np.concatenate([picked, extra[:cap - len(picked)]])
+    return idx[picked]
 
 
 def _voxel_pick(X, cap):
@@ -261,18 +268,43 @@ def _voxel_pick(X, cap):
     return first
 
 
-def _subsample_model(rec, target):
-    """Delete all but ~`target` spatially-even points so the bundle adjustment is tractable.
+def _pick_even(X, target, rng=None):
+    """Up to min(len(X), target) indices: an even one-per-voxel base for spatial coverage, then a
+    random top-up to actually REACH the budget.
 
-    A reprojection BA over millions of points factorizes a matrix that blows up super-linearly
-    (and pycolmap gives no way to swap in an iterative solver). But the camera poses we export
-    are well-constrained by a few hundred thousand well-distributed points + their observations,
-    so we keep a representative subset and drop the rest. Deletion is fast (~750k pts/s).
-    Returns the kept count.
+    Plain _voxel_pick returns only ~#occupied voxels. For a surface-distributed cloud (a building /
+    facade - points live on 2D manifolds, not in a volume) the occupied-voxel count grows ~B^2, not
+    B^3, so a 300k 'target' kept only ~20-60k points: the 'weirdly small point cloud'. Worse, the
+    fraction kept FALLS as you raise the target. The top-up fills the rest of the budget with extra
+    real points so the bundle adjust gets the density it was asked for, while the voxel base still
+    guarantees every region is represented (no bias toward one dense wall).
+    """
+    n = len(X)
+    if target is None or n <= target:
+        return np.arange(n)
+    base = _voxel_pick(X, target)
+    if len(base) >= target:
+        return base
+    rng = rng if rng is not None else np.random.default_rng(0)
+    mask = np.ones(n, dtype=bool)
+    mask[base] = False
+    extra = rng.choice(np.flatnonzero(mask), target - len(base), replace=False)
+    return np.concatenate([base, extra])
+
+
+def _subsample_model(rec, target):
+    """Delete all but ~`target` points (even coverage + random top-up) to bound the bundle adjust.
+
+    Above ~1000 images pycolmap auto-selects ITERATIVE_SCHUR, which scales near-linearly in points
+    (it does NOT factorize a dense matrix), and the LiDAR cost is now native/multi-threaded - so the
+    only reason to thin at all is to bound time and memory, and we can afford a LARGE subset. Use
+    _pick_even so we actually keep ~target points: plain voxel-picking returns only ~#occupied
+    voxels (~tens of thousands for a surface cloud no matter the target - the old 'tiny model' bug).
+    Deletion is fast (~750k pts/s). Returns the kept count.
     """
     ids = np.array(list(rec.points3D.keys()), dtype=np.int64)
     X = np.array([p.xyz for p in rec.points3D.values()], np.float64)
-    keep = set(int(i) for i in ids[_voxel_pick(X, target)])
+    keep = set(int(i) for i in ids[_pick_even(X, target)])
     for pid in ids.tolist():
         if pid not in keep:
             rec.delete_point3D(pid)
@@ -362,7 +394,7 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
     # candidate set is every point, so behaviour is identical to the per-round full read.
     all_objs = list(rec.points3D.values())
     X_all = np.array([p.xyz for p in all_objs], np.float64)
-    cand = _voxel_pick(X_all, cand_cap)
+    cand = _pick_even(X_all, cand_cap)              # reach cand_cap (one-per-voxel alone under-fills)
     cand_pts = [all_objs[k] for k in cand]
     n_cand = len(cand_pts)
     del all_objs, X_all
