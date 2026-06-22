@@ -530,9 +530,12 @@ class App:
                      tip="Only matches on locally flat patches of the cloud are trusted. Minimum "
                          "flatness (0 = anything, 1 = perfectly flat). Higher ignores edges, "
                          "foliage and clutter; lower uses more of the cloud.")
-        self._spin(solv, 4, "Re-match rounds", "outer_iters", 1, 30, 8,
+        self._spin(solv, 4, "Re-match rounds", "outer_iters", 0, 30, 8,
                    tip="How many times to re-pair points to the cloud and re-solve (ICP-style). "
-                       "More rounds settle a rough start; 8 is usually plenty.")
+                       "More rounds settle a rough start; 8 is usually plenty. Set to 0 for "
+                       "PRE-ALIGN ONLY - skips the bundle-adjust refine and just outputs the "
+                       "rough-aligned poses. Use it if the refine diverges (cameras collapse to a "
+                       "point): a good pre-align already places the cameras at the scan's scale.")
         self._spin(solv, 5, "Solver steps per round", "inner_iters", 10, 200, 50, inc=10,
                    tip="Optimiser iterations within each round. Higher converges harder per "
                        "round; 50 is plenty.")

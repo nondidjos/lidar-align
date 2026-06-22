@@ -323,6 +323,26 @@ def _sfm_aabb(rec):
     return P.min(0), P.max(0)
 
 
+def _camera_centers(rec):
+    out = []
+    for im in rec.images.values():
+        if not im.has_pose:
+            continue
+        M = np.asarray(im.cam_from_world().matrix(), float)
+        out.append(-M[:3, :3].T @ M[:3, 3])
+    return np.asarray(out) if out else np.zeros((0, 3))
+
+
+def _camera_spread(rec):
+    """Robust extent of the camera centres (2-98 percentile box diagonal, in metres). A near-zero
+    value means the poses collapsed to a point - a divergent free-gauge solve."""
+    C = _camera_centers(rec)
+    if len(C) < 2:
+        return 0.0
+    lo, hi = np.percentile(C, [2, 98], axis=0)
+    return float(np.linalg.norm(hi - lo))
+
+
 def refine(sparse_in, lidar, sparse_out,
            w_lidar=5.0, huber=0.1, outer_iters=5, inner_iters=50,
            voxel=None, k_plane=16, max_assoc_dist=0.5, planarity_min=0.1,
@@ -404,12 +424,36 @@ def refine(sparse_in, lidar, sparse_out,
         print(f"QA before: {qa.residual_stats(d0)}")
         stage("QA before written")
 
-    refine_reconstruction(rec, planes, w_lidar=w_lidar, huber=huber,
-                          outer_iters=outer_iters, inner_iters=inner_iters,
-                          max_assoc_dist=max_assoc_dist, planarity_min=planarity_min,
-                          anneal=anneal, max_lidar_residuals=max_lidar_residuals,
-                          fix_intrinsics=fix_intrinsics, cancel_cb=cancel_cb,
-                          early_stop_tol=early_stop_tol, verbose=verbose, stage=stage)
+    # Snapshot the pre-aligned model so we can fall back if the refine diverges. A free-gauge
+    # bundle adjustment over thousands of images can occasionally collapse the scale to a point
+    # (cameras pile onto one spot) when the pre-align already satisfied the LiDAR ties; a rigid
+    # pre-align cannot do that, so its result is the safe floor.
+    import tempfile
+    import shutil
+    pre_spread = _camera_spread(rec)
+    snap = tempfile.mkdtemp(prefix="lidar_prealign_")
+    try:
+        if outer_iters and pre_spread > 1e-6:
+            colmap_io.save(rec, snap)
+
+        refine_reconstruction(rec, planes, w_lidar=w_lidar, huber=huber,
+                              outer_iters=outer_iters, inner_iters=inner_iters,
+                              max_assoc_dist=max_assoc_dist, planarity_min=planarity_min,
+                              anneal=anneal, max_lidar_residuals=max_lidar_residuals,
+                              fix_intrinsics=fix_intrinsics, cancel_cb=cancel_cb,
+                              early_stop_tol=early_stop_tol, verbose=verbose, stage=stage)
+
+        post_spread = _camera_spread(rec)
+        if outer_iters and pre_spread > 1e-6 and post_spread < 0.25 * pre_spread:
+            print(f"[WARNING] the refine collapsed the cameras (spread {pre_spread:.1f} m -> "
+                  f"{post_spread:.1f} m) - reverting to the pre-aligned result, which is a clean "
+                  f"rigid placement. (Set 'Re-match rounds' = 0 to skip the refine next time.)")
+            rec = colmap_io.load(snap)
+            stage("reverted to pre-align (refine diverged)")
+    finally:
+        shutil.rmtree(snap, ignore_errors=True)
+    print(f"camera spread: {_camera_spread(rec):.1f} m "
+          f"({'OK' if _camera_spread(rec) > 1.0 else 'COLLAPSED - check the cloud/ties'})")
 
     # Always save what we have (a stopped run still leaves a partially-aligned model), but skip
     # the slow QA plane-query and XMP export on cancel so Stop returns promptly.
