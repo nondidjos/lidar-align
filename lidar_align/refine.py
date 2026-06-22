@@ -454,18 +454,8 @@ def refine(sparse_in, lidar, sparse_out,
               f"-> {rec.num_points3D():,} kept for alignment")
     stage(f"loaded reconstruction ({rec.num_reg_images()} imgs, {rec.num_points3D():,} pts)")
 
-    # A full reprojection BA over millions of points doesn't scale (the matrix factorization
-    # blows up and pycolmap won't let us pick an iterative solver), so reduce to a representative
-    # subset up front. The exported camera poses stay well-constrained; the saved sparse model is
-    # this subset. Set ba_max_points=None/0 to keep every point (only viable for small models).
-    if ba_max_points and rec.num_points3D() > ba_max_points:
-        before = rec.num_points3D()
-        print(f"reducing model {before:,} -> ~{ba_max_points:,} points so the bundle adjustment "
-              f"is tractable (poses stay constrained; saved model is this subset)…")
-        kept = _subsample_model(rec, ba_max_points)
-        print(f"  reduced to {kept:,} points")
-        stage(f"reduced model to {kept:,} pts")
-
+    # Pre-align on the FULL cleaned cloud (more points = better FPFH coverage for scale recovery);
+    # we only thin the model AFTER, for the bundle adjustment.
     if prealign:
         from .prealign import prealign_reconstruction
         print(f"pre-align: loading coarse cloud ({prealign_voxel} m voxel)…")
@@ -476,6 +466,17 @@ def refine(sparse_in, lidar, sparse_out,
         print(f"prealign[{prealign_method}]: scale={info['scale']:.4f} "
               f"fitness={info['fitness']:.3f} rmse={info['inlier_rmse']:.3f}")
         stage("pre-align done")
+
+    # The LiDAR cost is a Python Ceres cost, so the bundle adjust runs single-threaded (multi-thread
+    # = catastrophic GIL contention). Single-threaded the solve scales with residual count, so thin
+    # the model to a representative subset (~ba_max_points). The exported camera poses stay
+    # well-constrained and drift is low-frequency, so this doesn't hurt the alignment; the saved
+    # sparse model is this subset. ba_max_points=None/0 keeps every point (only small models).
+    if ba_max_points and rec.num_points3D() > ba_max_points:
+        before = rec.num_points3D()
+        kept = _subsample_model(rec, ba_max_points)
+        print(f"reduced model {before:,} -> {kept:,} points for the single-threaded bundle adjust")
+        stage(f"reduced model to {kept:,} pts")
 
     # units sanity: SfM extent (post-prealign) should match the LiDAR's metric scale
     lo, hi = _sfm_aabb(rec)
