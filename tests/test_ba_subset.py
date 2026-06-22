@@ -25,8 +25,30 @@ import pycolmap
 import laspy
 from pycolmap import Rotation3d, Sim3d
 
-from lidar_align.refine import _voxel_pick, _subsample_model, _spatial_subsample, refine
+from lidar_align.refine import _voxel_pick, _subsample_model, _spatial_subsample, _trim_outliers, refine
 from lidar_align.export_xmp import camera_pose
+
+
+def test_outlier_trim_fixes_prealign_scale():
+    """Far-outlier model points poison the pre-align's scale estimate; trimming them restores it.
+    Real-world failure: a handful of junk triangulations made the whole model come out ~2x too
+    small, so the cameras looked collapsed. (Pre-fix, 20 strays pulled a true-40 scale to 0.28.)"""
+    from lidar_align.prealign import prealign_reconstruction
+    rng = np.random.default_rng(0)
+    o = pycolmap.SyntheticDatasetOptions()
+    o.num_rigs = 1; o.num_cameras_per_rig = 1
+    o.num_frames_per_rig = 25; o.num_points3D = 3000; o.track_length = 5
+    rec = pycolmap.synthesize_dataset(o)
+    P = np.array([rec.points3D[i].xyz for i in rec.points3D])
+    TRUE = 40.0
+    lidar = (P - P.mean(0)) * TRUE + np.array([100.0, 200.0, 30.0])     # metric, true scale 40
+    for i in list(rec.points3D.keys())[:20]:                            # inject far junk points
+        rec.points3D[i].xyz = rec.points3D[i].xyz + rng.uniform(-400, 400, 3)
+    dropped = _trim_outliers(rec)
+    s = prealign_reconstruction(rec, lidar, method="auto", voxel=0.3)["scale"]
+    assert dropped >= 15, f"trim removed too few outliers: {dropped}"
+    assert 0.5 * TRUE < s < 1.5 * TRUE, f"trim failed to recover scale: {s:.2f} vs {TRUE}"
+    print(f"  outlier trim: dropped {dropped}, recovered scale {s:.1f} (true {TRUE})")
 
 
 def test_spatial_subsample_outlier_robust():
@@ -113,6 +135,7 @@ def test_tie_heavy_refine_completes_and_recovers():
 if __name__ == "__main__":
     test_voxel_pick_outlier_robust()
     test_spatial_subsample_outlier_robust()
+    test_outlier_trim_fixes_prealign_scale()
     test_subsample_model()
     test_tie_heavy_refine_completes_and_recovers()
     print("BA SUBSET/SCALE TEST: PASS")

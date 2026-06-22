@@ -235,6 +235,27 @@ def _subsample_model(rec, target):
     return rec.num_points3D()
 
 
+def _trim_outliers(rec, margin=3.0):
+    """Delete far-flung outlier points - junk SfM triangulations sitting kilometres from the
+    scene. They blow up the model's apparent extent and wreck the pre-align's scale estimate
+    (verified: 20 stray points pulled the recovered scale from a true 40 down to 0.28, i.e. the
+    whole model came out ~140x too small - that's the 'cameras collapsed' symptom). Keep points
+    within `margin` x the robust 0.5-99.5 percentile half-extent of the bulk. Returns #deleted.
+    """
+    ids = np.array(list(rec.points3D.keys()), dtype=np.int64)
+    if len(ids) < 100:
+        return 0
+    X = np.array([rec.points3D[int(i)].xyz for i in ids], np.float64)
+    lo = np.percentile(X, 0.5, axis=0)
+    hi = np.percentile(X, 99.5, axis=0)
+    c = (lo + hi) / 2.0
+    half = np.maximum(hi - lo, 1e-9) / 2.0 * margin
+    keep = np.all(np.abs(X - c) <= half, axis=1)
+    for pid in ids[~keep].tolist():
+        rec.delete_point3D(pid)
+    return int((~keep).sum())
+
+
 def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
                           outer_iters=5, inner_iters=50, max_assoc_dist=0.5,
                           planarity_min=0.1, anneal=True, max_lidar_residuals=30000,
@@ -404,6 +425,11 @@ def refine(sparse_in, lidar, sparse_out,
     rec = colmap_io.load(sparse_in)
     print(f"loaded {rec.num_reg_images()} images, {rec.num_points3D()} points")
     print(f"camera spread (as loaded, SfM frame): {_camera_spread(rec):.2f}")
+    # Drop far-outlier triangulations BEFORE anything else - they wreck the pre-align scale
+    # (a handful of stray points can make the whole model come out ~100x too small).
+    n_out = _trim_outliers(rec)
+    if n_out:
+        print(f"trimmed {n_out:,} far-outlier points (junk triangulations that skew the scale)")
     stage(f"loaded reconstruction ({rec.num_reg_images()} imgs, {rec.num_points3D():,} pts)")
 
     # A full reprojection BA over millions of points doesn't scale (the matrix factorization
