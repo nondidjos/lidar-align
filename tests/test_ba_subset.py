@@ -75,6 +75,31 @@ def test_voxel_pick_outlier_robust():
     print(f"  voxel_pick: {len(keep):,} candidates kept despite 50 extreme outliers")
 
 
+def test_robust_scale_recovery():
+    """Multi-scale FPFH+RANSAC recovers an unknown scale through repetitive structure AND partial
+    overlap - the case where proximity/extent/distance scores all locked at a 2-3x wrong scale."""
+    from lidar_align.prealign import robust_global_sim3
+    rng = np.random.default_rng(7)
+
+    def scene():
+        xs = np.arange(0, 14); ys = np.arange(0, 8)
+        arc = np.array([[x, y, 0.5 * np.sin(x)] for x in xs for y in ys], float)
+        col = np.array([[x, 0, z] for x in xs for z in np.linspace(0, 5, 12)])
+        tower = np.array([[13, 3, z] for z in np.linspace(0, 11, 30)])            # unique feature
+        P = np.vstack([arc, col, tower])
+        return np.repeat(P, 4, 0) + rng.standard_normal((len(P) * 4, 3)) * 0.03
+
+    M = scene()
+    TRUE = 37.0
+    L = np.vstack([M * TRUE + np.array([900, 400, 60]),                            # overlap
+                   (scene()[:1500] * TRUE + np.array([900, 400, 60])) + np.array([14 * TRUE, 0, 0])])
+    rg = robust_global_sim3(M, L, voxel=2.0)
+    assert rg is not None, "robust registration returned None on a structured scene"
+    s = rg[0]
+    assert 0.7 * TRUE < s < 1.4 * TRUE, f"recovered scale {s:.1f} vs true {TRUE} (scale lock?)"
+    print(f"  robust scale recovery: {s:.1f} (true {TRUE}), {rg[3]} geometric inliers")
+
+
 def test_subsample_model():
     o = pycolmap.SyntheticDatasetOptions()
     o.num_rigs = 1; o.num_cameras_per_rig = 1
@@ -136,6 +161,7 @@ if __name__ == "__main__":
     test_voxel_pick_outlier_robust()
     test_spatial_subsample_outlier_robust()
     test_outlier_trim_fixes_prealign_scale()
+    test_robust_scale_recovery()
     test_subsample_model()
     test_tie_heavy_refine_completes_and_recovers()
     print("BA SUBSET/SCALE TEST: PASS")
