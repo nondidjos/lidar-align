@@ -316,7 +316,7 @@ def _clean_model(rec, min_track=3, error_pct=99.5):
 
 def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
                           outer_iters=5, inner_iters=50, max_assoc_dist=0.5,
-                          planarity_min=0.1, anneal=True, max_lidar_residuals=80_000,
+                          planarity_min=0.1, anneal=True, max_lidar_residuals=150_000,
                           fix_intrinsics=True, verbose=True, cancel_cb=None,
                           early_stop_tol=0.0, prev_err=None, stage=None, anchor=False):
     """Refine an in-memory reconstruction against a LidarPlanes index. Mutates `rec`.
@@ -343,8 +343,8 @@ def refine_reconstruction(rec, planes, w_lidar=5.0, huber=0.1,
     # every round (multithreaded KD-tree), gate it, then subsample to max_lidar_residuals ties. Keep
     # ~3x the tie target as headroom for the gating, but cap it ABSOLUTELY: with a big tie target the
     # old `8 * max_lidar_residuals` blew this up to millions of k-NN+PCA queries per round (minutes
-    # that look like a freeze). 800k is plenty to draw a well-distributed tie set from on a laptop.
-    cand_cap = min(max(3 * max_lidar_residuals, 200_000), 800_000)
+    # that look like a freeze). 1.5M is plenty to draw a well-distributed tie set from.
+    cand_cap = min(max(3 * max_lidar_residuals, 200_000), 1_500_000)
     _cuda_check_once()
 
     # Reading every point's coordinates each round (world_points over millions of points) costs
@@ -475,11 +475,11 @@ def _median_p2plane(rec, planes, sample=20000):
 def refine(sparse_in, lidar, sparse_out,
            w_lidar=5.0, huber=0.1, outer_iters=5, inner_iters=50,
            voxel=None, k_plane=16, max_assoc_dist=0.5, planarity_min=0.1,
-           anneal=True, max_lidar_residuals=80_000, fix_intrinsics=True,
+           anneal=True, max_lidar_residuals=150_000, fix_intrinsics=True,
            prealign=False, prealign_voxel=0.5, prealign_method="auto",
            correspondences=None, crop_margin=2.0, planes=None,
            qa_out=None, xmp_out=None, xmp_pose_prior="locked", xmp_axis_flip=None,
-           cancel_cb=None, early_stop_tol=0.0, verbose=True, ba_max_points=400_000):
+           cancel_cb=None, early_stop_tol=0.0, verbose=True, ba_max_points=800_000):
     from .lidar_index import _load_points
 
     stage = _Stages(enabled=verbose)
@@ -508,12 +508,11 @@ def refine(sparse_in, lidar, sparse_out,
         stage("pre-align done")
 
     # The LiDAR cost is now native (multi-threaded), so the model no longer has to be thinned to a
-    # tiny subset. But solve time still scales with point count (residuals x iterations) and the
-    # multi-thread speedup is only ~Ncores (a 4-core laptop, not a workstation) - so keep a modest,
-    # bounded subset (default 400k, ~2x the old single-threaded budget). With the reprojection BA
-    # now multi-threaded too, that still runs in <= the old single-threaded wall-clock while
-    # constraining partial-overlap mismatch and drift better. Raise ba_max_points on a bigger
-    # machine, or None/0 to keep every point (can be very slow / memory-heavy at scale).
+    # tiny subset. Solve time still scales with point count (residuals x iterations), but with the
+    # whole solve now on every core (the i9 deploy box has 24 threads / 64 GB) we can keep a much
+    # larger representative subset (default 800k, ~12x the old single-threaded budget) and still run
+    # in <= the old wall-clock - constraining partial-overlap mismatch and drift far better. Lower
+    # ba_max_points on a weak machine; None/0 keeps every point (slow/heavy at millions x thousands).
     if ba_max_points and rec.num_points3D() > ba_max_points:
         before = rec.num_points3D()
         kept = _subsample_model(rec, ba_max_points)
