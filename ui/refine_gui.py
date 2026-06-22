@@ -1007,13 +1007,20 @@ class App:
                     "--ImageReader.single_camera", "1",
                     "--ImageReader.camera_model", a["camera"],
                     "--SiftExtraction.max_num_features", a["max_feats"]]
-            if a["quality"] == "high":
-                # affine-shape + DSP improve matches on blurry frames but COLMAP runs them
-                # CPU-only; set use_gpu 0 so the (slow) CPU path is explicit, not a surprise.
+            fisheye_cam = (a["camera"] == "OPENCV_FISHEYE")
+            if a["quality"] == "high" or fisheye_cam:
+                # DSP-SIFT + affine-shape: COLMAP's documented recipe for more matches on hard data.
+                # The affine-shape estimate adapts each feature to the LOCAL warp, which is the only
+                # way plain SIFT can match across a fisheye's distortion - the difference between a
+                # usable model and noise on a 155-deg lens. FORCED for fisheye even on 'fast'. COLMAP
+                # can't GPU these, so it's CPU-only (slow on many photos - thin the frames if needed).
                 feat += ["--SiftExtraction.estimate_affine_shape", "1",
                          "--SiftExtraction.domain_size_pooling", "1",
                          f"--{ext_gpu}", "0"]
-                self.q.put(("log", "[feature quality HIGH: CPU SIFT - slow on many photos]\n"))
+                why = ("fisheye lens -> forcing DSP-SIFT + affine-shape (plain SIFT can't match a "
+                       "fisheye)" if fisheye_cam and a["quality"] != "high"
+                       else "feature quality HIGH: DSP-SIFT + affine-shape")
+                self.q.put(("log", f"[{why}; CPU-only, slower on many photos]\n"))
             else:
                 feat += [f"--{ext_gpu}", "1"]
             if not run(feat, "feature_extractor"):
@@ -1028,6 +1035,7 @@ class App:
                                 "SequentialPairing.loop_detection")
             vocab_opt = _present(fm, "SequentialMatching.vocab_tree_path",
                                  "SequentialPairing.vocab_tree_path")
+            guided_opt = _present(fm, "FeatureMatching.guided_matching", "SiftMatching.guided_matching")
             # loop closure needs a real vocab-tree file and a supported option
             use_vocab = bool(a["vocab"]) and os.path.isfile(a["vocab"]) and bool(vocab_opt)
             match = [a["colmap"], "sequential_matcher", "--database_path", a["db"],
@@ -1038,6 +1046,11 @@ class App:
                 match += [f"--{loop_opt}", "1" if use_vocab else "0"]
             if use_vocab:
                 match += [f"--{vocab_opt}", a["vocab"]]
+            if fisheye_cam and guided_opt:
+                # guided matching re-matches using the estimated two-view geometry - recovers more
+                # inliers across the heavy distortion of a wide/fisheye lens.
+                match += [f"--{guided_opt}", "1"]
+                self.q.put(("log", "[fisheye: guided_matching on - more inliers across distortion]\n"))
             if not run(match, "sequential_matcher"):
                 return self.q.put(("done", 1))
 
