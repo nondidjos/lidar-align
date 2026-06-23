@@ -254,7 +254,55 @@ def test_manual_align_recovers():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def test_manual_align_georeferenced():
+    """The unbound-component path in the multi-component workflow: the placement window writes a Sim3
+    that maps an arbitrary-frame model onto a GEOREFERENCED (UTM) scan. refine(manual_align=..) must
+    apply that Sim3, solve in a local frame, and write the cameras back in the scan's UTM frame.
+    Exercises the manual_align + georef-origin composition that the local-scan manual test does not."""
+    from lidar_align.export_xmp import camera_pose
+    np.random.seed(1)
+    work = tempfile.mkdtemp(prefix="lidar_align_mangeo_")
+    try:
+        UTM = np.array([500000.0, 4500000.0, 60.0])          # realistic georeferenced offset
+        opts = pycolmap.SyntheticDatasetOptions()
+        opts.num_rigs = 1; opts.num_cameras_per_rig = 1
+        opts.num_frames_per_rig = 10; opts.num_points3D = 300; opts.track_length = 10
+        rec = pycolmap.synthesize_dataset(opts)
+        ids = list(rec.points3D.keys())
+        truth = {p: np.array(rec.points3D[p].xyz, float) for p in ids}
+        truth_cam = {im.image_id: camera_pose(im)[1] for im in rec.images.values() if im.has_pose}
+        # georeferenced scan: planar lidar around the truth points, shifted into UTM
+        _write_las(os.path.join(work, "l.las"),
+                   _planar_lidar(np.array([truth[p] for p in ids])) + UTM)
+
+        s, ang = 0.4, np.deg2rad(15)
+        q = np.array([0.0, 0.0, np.sin(ang / 2), np.cos(ang / 2)])
+        R = pycolmap.Rotation3d(q).matrix(); t = np.array([2.0, -1.0, 3.0])
+        rec.transform(Sim3d(s, Rotation3d(q), t))            # truth -> arbitrary unbound frame
+        si = os.path.join(work, "si"); os.makedirs(si); rec.write(si)
+        # the Sim3 the placement window would write: arbitrary-frame model -> the UTM scan
+        man = {"scale": 1.0 / s, "R": R.T.tolist(),
+               "t": (-(1.0 / s) * (R.T @ t) + UTM).tolist()}
+        mj = os.path.join(work, "m.json"); json.dump(man, open(mj, "w"))
+
+        run_refine(sparse_in=si, lidar=os.path.join(work, "l.las"),
+                   sparse_out=os.path.join(work, "so"), manual_align=mj, prealign=False,
+                   w_lidar=20.0, huber=0.2, outer_iters=10, inner_iters=30,
+                   max_assoc_dist=0.5, planarity_min=0.05)
+        ref = load_model(os.path.join(work, "so"))
+        cams = [camera_pose(im)[1] for im in ref.images.values() if im.has_pose]
+        assert np.mean(np.abs(cams)) > 1e4, "cameras did not come back in the scan's UTM frame"
+        e = float(np.mean([np.linalg.norm(camera_pose(im)[1] - (truth_cam[im.image_id] + UTM))
+                           for im in ref.images.values() if im.has_pose and im.image_id in truth_cam]))
+        assert e < 0.05, f"manual_align+georef did not recover (camera err {e:.4f} m)"
+        print(f"MANUAL ALIGN + GEOREF: PASS  unbound model placed onto a UTM scan, cameras "
+              f"georeferenced, polished to {e * 100:.2f} cm")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_pipeline_end_to_end()
     test_georeferenced_accuracy()
     test_manual_align_recovers()
+    test_manual_align_georeferenced()

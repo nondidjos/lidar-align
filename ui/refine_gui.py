@@ -643,8 +643,10 @@ class App:
                         "cameras look mirrored or upside-down, then try the presets.")
         self._path_row(out, 5, "Existing model (skip Step 1)", "model_override", "", "dir",
                        tip="Point straight at an existing COLMAP/GLOMAP/GLUEMAP model folder (sparse/0) "
-                           "to skip building one. Perfect for using models pre-built with GLUEMAP. "
-                           "Blank = use the model Step 1 makes.")
+                           "to skip building one. Perfect for using models pre-built with GLUEMAP, or "
+                           "for a RealityScan export. For 'Align components' point at the PARENT folder "
+                           "holding the component subfolders (e.g. the sparse/ that contains 0/, 1/, …) "
+                           "- it finds them all. Blank = use the model Step 1 makes.")
 
         # Photo alignment (SfM)
         sf = ttk.Labelframe(parent, text="Photo alignment (SfM, Step 1)", padding=8)
@@ -1408,6 +1410,11 @@ class App:
             kw, _photos = self._refine_kwargs()
         except ValueError as e:
             return messagebox.showerror("Invalid input", str(e))
+        if not kw["xmp_out"]:
+            return messagebox.showerror(
+                "No XMP output", "The .xmp camera sidecars are the point of this run, but there's "
+                "nowhere to write them.\n\nSet the Photos folder (xmp lands next to the images) or an "
+                "XMP output folder under Advanced, then try again.")
         self._start(f"aligning {len(comps)} component(s) onto the LiDAR…",
                     self._multi_align_worker, (comps, kw))
 
@@ -1420,26 +1427,35 @@ class App:
             from lidar_align.lidar_index import _load_points
             lidar, xmp_out, out_base = kw["lidar"], kw["xmp_out"], kw["sparse_out"]
             with contextlib.redirect_stdout(_QueueWriter(self.q)):
-                print(f"found {len(comps)} component(s); peeking scan extent…")
+                print(f"found {len(comps)} component(s); peeking scan extent for the placement test…")
                 peek = _load_points(lidar, voxel=1.0, max_points=200_000, log=print)
                 lo, hi = peek.min(0), peek.max(0)
                 del peek
+                # classify everything up front so the plan -- and how many placement windows will
+                # pop -- is visible before anything blocks waiting on a window
+                plan = [(i, comp, component_placed(colmap_io.load(comp), lo, hi))
+                        for i, comp in enumerate(comps)]
+                n_manual = sum(1 for _, _, p in plan if not p)
+                print(f"\nplan: {len(plan) - n_manual} in scan coords (auto-refine), "
+                      f"{n_manual} unbound (a placement window pops for each):")
+                for i, comp, p in plan:
+                    print(f"  comp{i}  [{'auto  ' if p else 'manual'}]  {comp}")
             done = 0
-            for i, comp in enumerate(comps):
+            for i, comp, placed in plan:
                 if self._cancel.is_set():
                     self.q.put(("log", "\n[stopped]\n")); break
-                placed = component_placed(colmap_io.load(comp), lo, hi)
                 out_i = os.path.join(out_base, f"comp{i}")
                 ckw = dict(kw, sparse_in=comp, sparse_out=out_i, xmp_out=xmp_out,
                            correspondences=None, manual_align=None, prealign=False)
                 if placed:
-                    self.q.put(("log", f"\n=== component {i+1}/{len(comps)}: in scan coords -> "
+                    self.q.put(("log", f"\n=== comp{i} ({i + 1}/{len(plan)}): in scan coords -> "
                                        f"refining ===\n"))
                     refine(**ckw); done += 1
                     continue
                 # unbound -> pop the placement window, then refine with the manual Sim3
-                self.q.put(("log", f"\n=== component {i+1}/{len(comps)}: UNBOUND -> opening the "
-                                   f"placement window; place it on the scan, ENTER to accept ===\n"))
+                self.q.put(("log", f"\n=== comp{i} ({i + 1}/{len(plan)}): UNBOUND -> opening the "
+                                   f"placement window. Match it to the scan, click Accept "
+                                   f"(or close the window to skip this one). ===\n"))
                 os.makedirs(out_i, exist_ok=True)
                 with contextlib.redirect_stdout(_QueueWriter(self.q)):
                     rc = colmap_io.load(comp); _clean_model(rc)
@@ -1458,10 +1474,11 @@ class App:
                 proc.wait(); self._proc = None
                 if os.path.isfile(mj):
                     ckw["manual_align"] = mj
+                    self.q.put(("log", f"  placement accepted; refining comp{i}…\n"))
                     refine(**ckw); done += 1
                 else:
-                    self.q.put(("log", f"[component {i+1}] skipped (no placement)\n"))
-            self.q.put(("log", f"\nDone: {done}/{len(comps)} component(s) aligned. XMP -> {xmp_out}\n"))
+                    self.q.put(("log", f"  comp{i} skipped (no placement accepted)\n"))
+            self.q.put(("log", f"\nDone: {done}/{len(plan)} component(s) aligned. XMP -> {xmp_out}\n"))
             self.q.put(("done", 0))
         except Exception:
             self.q.put(("log", "\n" + traceback.format_exc()))

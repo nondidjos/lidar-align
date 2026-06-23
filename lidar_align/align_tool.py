@@ -114,7 +114,30 @@ def manual_align_gui(scan, model0, out_json):
 
     em = w.theme.font_size
     panel = gui.Vert(0.4 * em, gui.Margins(0.6 * em, 0.6 * em, 0.6 * em, 0.6 * em))
-    panel.add_child(gui.Label("Drag to match the orange model onto the gray scan."))
+    panel.add_child(gui.Label("Drag the sliders to match the orange MODEL onto the gray SCAN,"))
+    panel.add_child(gui.Label("then click ACCEPT.  (Mouse-drag in the view = orbit / look around.)"))
+
+    import math
+    sliders = {}
+
+    def do_reset():
+        sliders["scale"](math.log10(s0))   # each set_value resets the bar, label, state, and view
+        for nm in ("Yaw", "Pitch", "Roll", "Move X", "Move Y", "Move Z"):
+            sliders[nm](0.0)
+        _log("reset")
+
+    def do_accept():
+        st["ok"] = True; _log("ACCEPT"); app.quit()
+
+    # buttons sit at the TOP of the panel so Accept/Cancel are always on screen, even if the window
+    # is taller than the display and the lower sliders get clipped
+    row = gui.Horiz(0.4 * em)
+    b_ok = gui.Button("Accept"); b_ok.set_on_clicked(do_accept)
+    b_rs = gui.Button("Reset"); b_rs.set_on_clicked(do_reset)
+    b_cx = gui.Button("Cancel"); b_cx.set_on_clicked(lambda: (_log("CANCEL"), app.quit()))
+    row.add_child(b_ok); row.add_child(b_rs); row.add_child(b_cx)
+    panel.add_child(row)
+    panel.add_child(gui.Label(""))
 
     def _slider(label, lo, hi, val, on_change):
         panel.add_child(gui.Label(label))
@@ -132,8 +155,6 @@ def manual_align_gui(scan, model0, out_json):
         panel.add_child(out)
         return set_value            # callers store this to drive the slider from code (e.g. Reset)
 
-    import math
-    sliders = {}
     sliders["scale"] = _slider("Scale", math.log10(s0) - 1.3, math.log10(s0) + 1.3, math.log10(s0),
                                lambda v: (st.__setitem__("s", 10.0 ** v), update(),
                                           f"scale = {st['s']:.4f}")[-1])
@@ -150,21 +171,6 @@ def manual_align_gui(scan, model0, out_json):
             return f
         sliders[nm] = _slider(nm, -diag, diag, 0, mk_mov(idx, nm))
 
-    def do_reset():
-        sliders["scale"](math.log10(s0))   # each set_value resets the bar, label, state, and view
-        for nm in ("Yaw", "Pitch", "Roll", "Move X", "Move Y", "Move Z"):
-            sliders[nm](0.0)
-        _log("reset")
-
-    def do_accept():
-        st["ok"] = True; _log("ACCEPT"); app.quit()
-
-    row = gui.Horiz(0.4 * em)
-    b_ok = gui.Button("Accept"); b_ok.set_on_clicked(do_accept)
-    b_rs = gui.Button("Reset"); b_rs.set_on_clicked(do_reset)
-    b_cx = gui.Button("Cancel"); b_cx.set_on_clicked(lambda: (_log("CANCEL"), app.quit()))
-    row.add_child(b_ok); row.add_child(b_rs); row.add_child(b_cx)
-    panel.add_child(row)
     w.add_child(panel)
 
     def on_layout(ctx):
