@@ -802,7 +802,15 @@ class App:
                                             _export_picking_ply)
             from lidar_align.lidar_index import _load_points
             lidar, xmp_out, out_base = kw["lidar"], kw["xmp_out"], kw["sparse_out"]
-            with contextlib.redirect_stdout(_QueueWriter(self.q)):
+            os.makedirs(out_base, exist_ok=True)
+            log_path = os.path.join(out_base, "align_components_" + time.strftime("%Y%m%d_%H%M%S")
+                                    + ".log")
+            self.q.put(("log", f"(full log -> {log_path})\n"))
+            # Tee EVERYTHING (incl. each component's refine output) to the GUI and a log file. The
+            # refine() calls print the per-round stats / stage timings; without this redirect they'd
+            # go to a dead stdout and the window would sit silent through the longest part of the run.
+            with open(log_path, "w", encoding="utf-8", errors="replace") as lf, \
+                    contextlib.redirect_stdout(_Tee(_QueueWriter(self.q), lf)):
                 print(f"found {len(comps)} component(s); peeking scan extent for the placement test…")
                 peek = _load_points(lidar, voxel=1.0, max_points=200_000, log=print)
                 lo, hi = peek.min(0), peek.max(0)
@@ -816,45 +824,43 @@ class App:
                       f"{n_manual} unbound (a placement window pops for each):")
                 for i, comp, p in plan:
                     print(f"  comp{i}  [{'auto  ' if p else 'manual'}]  {comp}")
-            done = 0
-            for i, comp, placed in plan:
-                if self._cancel.is_set():
-                    self.q.put(("log", "\n[stopped]\n")); break
-                out_i = os.path.join(out_base, f"comp{i}")
-                ckw = dict(kw, sparse_in=comp, sparse_out=out_i, xmp_out=xmp_out,
-                           correspondences=None, manual_align=None, prealign=False)
-                if placed:
-                    self.q.put(("log", f"\n=== comp{i} ({i + 1}/{len(plan)}): in scan coords -> "
-                                       f"refining ===\n"))
-                    refine(**ckw); done += 1
-                    continue
-                # unbound -> pop the placement window, then refine with the manual Sim3
-                self.q.put(("log", f"\n=== comp{i} ({i + 1}/{len(plan)}): UNBOUND -> opening the "
-                                   f"placement window. Match it to the scan, click Accept "
-                                   f"(or close the window to skip this one). ===\n"))
-                os.makedirs(out_i, exist_ok=True)
-                with contextlib.redirect_stdout(_QueueWriter(self.q)):
+                done = 0
+                for i, comp, placed in plan:
+                    if self._cancel.is_set():
+                        print("\n[stopped]"); break
+                    out_i = os.path.join(out_base, f"comp{i}")
+                    ckw = dict(kw, sparse_in=comp, sparse_out=out_i, xmp_out=xmp_out,
+                               correspondences=None, manual_align=None, prealign=False,
+                               cancel_cb=self._cancel.is_set)   # let Stop break out mid-solve
+                    if placed:
+                        print(f"\n=== comp{i} ({i + 1}/{len(plan)}): in scan coords -> refining ===")
+                        refine(**ckw); done += 1
+                        continue
+                    # unbound -> pop the placement window, then refine with the manual Sim3
+                    print(f"\n=== comp{i} ({i + 1}/{len(plan)}): UNBOUND -> opening the placement "
+                          f"window. Match it to the scan, click Accept (or close to skip). ===")
+                    os.makedirs(out_i, exist_ok=True)
                     rc = colmap_io.load(comp); _clean_model(rc)
                     ply = os.path.join(out_i, "model_for_picking.ply"); _export_picking_ply(rc, ply)
-                mj = os.path.join(out_i, "manual_align.json")
-                cmd = ([sys.executable, "--align-tool", lidar, ply, mj]
-                       if getattr(sys, "frozen", False)
-                       else [sys.executable, os.path.abspath(__file__), "--align-tool", lidar, ply, mj])
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                        text=True, bufsize=1)
-                self._proc = proc
-                for line in proc.stdout:
-                    self.q.put(("log", line))
-                    if self._cancel.is_set():
-                        _kill_tree(proc); break
-                proc.wait(); self._proc = None
-                if os.path.isfile(mj):
-                    ckw["manual_align"] = mj
-                    self.q.put(("log", f"  placement accepted; refining comp{i}…\n"))
-                    refine(**ckw); done += 1
-                else:
-                    self.q.put(("log", f"  comp{i} skipped (no placement accepted)\n"))
-            self.q.put(("log", f"\nDone: {done}/{len(plan)} component(s) aligned. XMP -> {xmp_out}\n"))
+                    mj = os.path.join(out_i, "manual_align.json")
+                    cmd = ([sys.executable, "--align-tool", lidar, ply, mj]
+                           if getattr(sys, "frozen", False)
+                           else [sys.executable, os.path.abspath(__file__), "--align-tool", lidar, ply, mj])
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            text=True, errors="replace", bufsize=1)
+                    self._proc = proc
+                    for line in proc.stdout:
+                        print(line, end="")                 # tee'd to GUI + the components log file
+                        if self._cancel.is_set():
+                            _kill_tree(proc); break
+                    proc.wait(); self._proc = None
+                    if os.path.isfile(mj):
+                        ckw["manual_align"] = mj
+                        print(f"  placement accepted; refining comp{i}…")
+                        refine(**ckw); done += 1
+                    else:
+                        print(f"  comp{i} skipped (no placement accepted)")
+                print(f"\nDone: {done}/{len(plan)} component(s) aligned. XMP -> {xmp_out}")
             self.q.put(("done", 0))
         except Exception:
             self.q.put(("log", "\n" + traceback.format_exc()))
@@ -862,20 +868,21 @@ class App:
 
     # ── RealityScan round-trip: drive its CLI to pull components in / push poses back ─────
     def _run_rs(self, cmd):
-        """Run a RealityScan CLI command, streaming its output and honouring Stop. Returns the exit
-        code (or -1 if it couldn't even launch)."""
-        self.q.put(("log", "  " + " ".join((f'"{c}"' if " " in c else c) for c in cmd) + "\n\n"))
+        """Run a RealityScan CLI command, streaming its output to the caller's stdout (so a wrapping
+        redirect tees it to the GUI + a log file) and honouring Stop. Returns the exit code (or -1
+        if it couldn't even launch)."""
+        print("  " + " ".join((f'"{c}"' if " " in c else c) for c in cmd) + "\n")
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, errors="replace", bufsize=1, creationflags=flags)
         except OSError as e:
-            self.q.put(("log", f"could not launch RealityScan: {e}\n"))
+            print(f"could not launch RealityScan: {e}")
             return -1
         self._proc = proc
         try:
             for line in proc.stdout:                        # errors="replace": a non-UTF8 log line
-                self.q.put(("log", line))                   # must not crash the read loop
+                print(line, end="")                         # must not crash the read loop
                 if self._cancel.is_set():
                     _kill_tree(proc); break
         finally:
@@ -905,28 +912,34 @@ class App:
                      self._abs(preset) if preset else None))
 
     def _rs_pull_worker(self, exe, proj, out_dir, preset):
+        log_path = os.path.join(os.path.dirname(out_dir) or ".",
+                                "realityscan_pull_" + time.strftime("%Y%m%d_%H%M%S") + ".log")
         try:
             if os.path.isdir(out_dir):
                 shutil.rmtree(out_dir, ignore_errors=True)  # a stale export must not mix into discover
             os.makedirs(out_dir, exist_ok=True)
-            cmd = ([exe, "-headless", "-load", proj, "-exportRegistration", out_dir]
-                   + ([preset] if preset else []) + ["-quit"])
-            rc = self._run_rs(cmd)
-            if self._cancel.is_set():
-                self.q.put(("done", 1)); return             # user Stopped: don't cry "RealityScan error"
-            if rc != 0:
-                self.q.put(("log", f"\nRealityScan exited {rc}. Check the .exe path, the project, and "
-                                   f"that the COLMAP export preset is valid.\n"))
-                self.q.put(("done", 1)); return
-            from lidar_align.refine import discover_components
-            comps = discover_components(out_dir)
-            if not comps:
-                self.q.put(("log", f"\nRealityScan finished but no COLMAP model landed under "
-                                   f"{out_dir}.\nYour export preset is probably not set to the COLMAP "
-                                   f"format - re-save it from the Export Registration dialog.\n"))
-                self.q.put(("done", 1)); return
-            self.q.put(("log", f"\nexported {len(comps)} component(s):\n"
-                               + "".join(f"  {c}\n" for c in comps)))
+            self.q.put(("log", f"(full log -> {log_path})\n"))
+            with open(log_path, "w", encoding="utf-8", errors="replace") as lf, \
+                    contextlib.redirect_stdout(_Tee(_QueueWriter(self.q), lf)):
+                cmd = ([exe, "-headless", "-load", proj, "-exportRegistration", out_dir]
+                       + ([preset] if preset else []) + ["-quit"])
+                rc = self._run_rs(cmd)
+                if self._cancel.is_set():
+                    self.q.put(("done", 1)); return         # user Stopped: don't cry "RealityScan error"
+                if rc != 0:
+                    print(f"\nRealityScan exited {rc}. Check the .exe path, the project, and that the "
+                          f"COLMAP export preset is valid.")
+                    self.q.put(("done", 1)); return
+                from lidar_align.refine import discover_components
+                comps = discover_components(out_dir)
+                if not comps:
+                    print(f"\nRealityScan finished but no COLMAP model landed under {out_dir}.\n"
+                          f"Your export preset is probably not set to the COLMAP format - re-save it "
+                          f"from the Export Registration dialog.")
+                    self.q.put(("done", 1)); return
+                print(f"\nexported {len(comps)} component(s):")
+                for c in comps:
+                    print(f"  {c}")
             self.q.put(("rs_pulled", out_dir))
             self.q.put(("done", 0))
         except Exception:
@@ -953,25 +966,30 @@ class App:
                     (self._abs(exe), ph, save_to, bool(self.var["rs_mesh"].get())))
 
     def _rs_send_worker(self, exe, photos, save_to, mesh):
+        log_path = os.path.join(os.path.dirname(save_to) or ".",
+                                "realityscan_send_" + time.strftime("%Y%m%d_%H%M%S") + ".log")
         try:
-            # RealityScan reads an .xmp sitting next to each image as that camera's calibration, so
-            # adding the folder pulls in the corrected (locked) poses; -align rebuilds the component
-            # from those priors. A fresh project is built so the original alignment is left intact.
-            cmd = [exe, "-headless", "-addFolder", photos, "-align"]
-            if mesh:
-                cmd += ["-calculateNormalModel"]
-            cmd += ["-save", save_to, "-quit"]
-            rc = self._run_rs(cmd)
-            if self._cancel.is_set():
-                self.q.put(("done", 1)); return             # user Stopped: don't cry "RealityScan error"
-            if rc == 0 and os.path.isfile(save_to):
-                self.q.put(("log", f"\ndone. corrected project -> {save_to}\n"
-                                   f"Open it in RealityScan; the cameras sit on the LiDAR.\n"))
-                self.q.put(("done", 0))
-            else:
-                self.q.put(("log", f"\nRealityScan exited {rc} and no project landed at {save_to}.\n"
-                                   f"Check the .exe path and that the .xmp are next to the photos.\n"))
-                self.q.put(("done", 1))
+            self.q.put(("log", f"(full log -> {log_path})\n"))
+            with open(log_path, "w", encoding="utf-8", errors="replace") as lf, \
+                    contextlib.redirect_stdout(_Tee(_QueueWriter(self.q), lf)):
+                # RealityScan reads an .xmp sitting next to each image as that camera's calibration, so
+                # adding the folder pulls in the corrected (locked) poses; -align rebuilds the component
+                # from those priors. A fresh project is built so the original alignment is left intact.
+                cmd = [exe, "-headless", "-addFolder", photos, "-align"]
+                if mesh:
+                    cmd += ["-calculateNormalModel"]
+                cmd += ["-save", save_to, "-quit"]
+                rc = self._run_rs(cmd)
+                if self._cancel.is_set():
+                    self.q.put(("done", 1)); return         # user Stopped: don't cry "RealityScan error"
+                if rc == 0 and os.path.isfile(save_to):
+                    print(f"\ndone. corrected project -> {save_to}\n"
+                          f"Open it in RealityScan; the cameras sit on the LiDAR.")
+                    self.q.put(("done", 0))
+                else:
+                    print(f"\nRealityScan exited {rc} and no project landed at {save_to}.\n"
+                          f"Check the .exe path and that the .xmp are next to the photos.")
+                    self.q.put(("done", 1))
         except Exception:
             self.q.put(("log", "\n" + traceback.format_exc()))
             self.q.put(("done", 1))
