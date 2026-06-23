@@ -1323,9 +1323,14 @@ class App:
             # is windowed so this is how you see it). Outside the redirect so lines flush as they come.
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, bufsize=1)
+            self._proc = proc                              # so Stop / close can kill the 3D window
             for line in proc.stdout:
                 self.q.put(("log", line))
+                if self._cancel.is_set():
+                    _kill_tree(proc)
+                    break
             rc = proc.wait()
+            self._proc = None
             if rc == 0 and os.path.isfile(out_json):
                 self._manual_align = out_json
                 self.q.put(("log", f"\n[align] saved your placement -> {out_json}\n"
@@ -1365,9 +1370,15 @@ class App:
                 print("opening the model in 3D — is the structure recognizable, or is it noise?")
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, bufsize=1)
+            self._proc = proc                              # so Stop / close can kill the 3D window
             for line in proc.stdout:
                 self.q.put(("log", line))
-            self.q.put(("done", proc.wait()))
+                if self._cancel.is_set():
+                    _kill_tree(proc)
+                    break
+            proc.wait()
+            self._proc = None
+            self.q.put(("done", proc.returncode))
         except Exception:
             self.q.put(("log", "\n" + traceback.format_exc()))
             self.q.put(("done", 1))

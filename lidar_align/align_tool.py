@@ -120,15 +120,17 @@ def manual_align_gui(scan, model0, out_json):
         panel.add_child(gui.Label(label))
         sl = gui.Slider(gui.Slider.DOUBLE)
         sl.set_limits(lo, hi)
-        sl.double_value = val
         out = gui.Label("")
         def cb(v):
             out.text = on_change(v)
         sl.set_on_value_changed(cb)
-        out.text = on_change(val)
+        def set_value(v):           # a programmatic double_value set does NOT fire cb, so do it here
+            sl.double_value = v
+            cb(v)                   # -> refreshes the value label + applies the transform
+        set_value(val)
         panel.add_child(sl)
         panel.add_child(out)
-        return sl
+        return set_value            # callers store this to drive the slider from code (e.g. Reset)
 
     import math
     sliders = {}
@@ -149,11 +151,9 @@ def manual_align_gui(scan, model0, out_json):
         sliders[nm] = _slider(nm, -diag, diag, 0, mk_mov(idx, nm))
 
     def do_reset():
-        st.update(s=s0); st["t"][:] = 0.0; st["e"][:] = 0.0
-        sliders["scale"].double_value = math.log10(s0)
+        sliders["scale"](math.log10(s0))   # each set_value resets the bar, label, state, and view
         for nm in ("Yaw", "Pitch", "Roll", "Move X", "Move Y", "Move Z"):
-            sliders[nm].double_value = 0.0
-        update()
+            sliders[nm](0.0)
         _log("reset")
 
     def do_accept():
