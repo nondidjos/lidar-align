@@ -1525,18 +1525,21 @@ class App:
         """Run a RealityScan CLI command, streaming its output and honouring Stop. Returns the exit
         code (or -1 if it couldn't even launch)."""
         self.q.put(("log", "  " + " ".join((f'"{c}"' if " " in c else c) for c in cmd) + "\n\n"))
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, bufsize=1)
+                                    text=True, errors="replace", bufsize=1, creationflags=flags)
         except OSError as e:
             self.q.put(("log", f"could not launch RealityScan: {e}\n"))
             return -1
         self._proc = proc
-        for line in proc.stdout:
-            self.q.put(("log", line))
-            if self._cancel.is_set():
-                _kill_tree(proc); break
-        proc.wait(); self._proc = None
+        try:
+            for line in proc.stdout:                        # errors="replace": a non-UTF8 log line
+                self.q.put(("log", line))                   # must not crash the read loop
+                if self._cancel.is_set():
+                    _kill_tree(proc); break
+        finally:
+            proc.wait(); self._proc = None                  # never leave RealityScan orphaned
         return proc.returncode
 
     def rs_pull_run(self):
@@ -1550,6 +1553,12 @@ class App:
         if not (proj and os.path.isfile(self._abs(proj))):
             return messagebox.showerror("No project", "Set your RealityScan .rsproj (Advanced).")
         preset = self.var["rs_export_preset"].get().strip()
+        if not preset and not messagebox.askyesno(
+                "No COLMAP preset",
+                "No COLMAP export preset is set, so RealityScan falls back to its current export "
+                "settings - which only give COLMAP if that format is already selected there.\n\n"
+                "Export anyway?"):
+            return
         out_dir = os.path.join(self._paths()["project"], "rs_export")
         self._start("exporting the RealityScan alignment to COLMAP…", self._rs_pull_worker,
                     (self._abs(exe), self._abs(proj), out_dir,
@@ -1557,10 +1566,14 @@ class App:
 
     def _rs_pull_worker(self, exe, proj, out_dir, preset):
         try:
+            if os.path.isdir(out_dir):
+                shutil.rmtree(out_dir, ignore_errors=True)  # a stale export must not mix into discover
             os.makedirs(out_dir, exist_ok=True)
             cmd = ([exe, "-headless", "-load", proj, "-exportRegistration", out_dir]
                    + ([preset] if preset else []) + ["-quit"])
             rc = self._run_rs(cmd)
+            if self._cancel.is_set():
+                self.q.put(("done", 1)); return             # user Stopped: don't cry "RealityScan error"
             if rc != 0:
                 self.q.put(("log", f"\nRealityScan exited {rc}. Check the .exe path, the project, and "
                                    f"that the COLMAP export preset is valid.\n"))
@@ -1592,8 +1605,7 @@ class App:
             return messagebox.showerror("No photos", "Set the Photos folder - the corrected .xmp sit "
                                         "next to those images.")
         ph = self._abs(photos)
-        import glob as _glob
-        if not _glob.glob(os.path.join(ph, "*.xmp")):
+        if not any(f.lower().endswith(".xmp") for f in os.listdir(ph)):
             return messagebox.showerror("No XMP yet", "No .xmp found next to the photos. Run 'Align "
                                         "components' with 'Write XMP next to photos' on first.")
         save_to = os.path.join(self._paths()["project"], "rs_corrected.rsproj")
@@ -1610,13 +1622,16 @@ class App:
                 cmd += ["-calculateNormalModel"]
             cmd += ["-save", save_to, "-quit"]
             rc = self._run_rs(cmd)
-            if rc == 0:
+            if self._cancel.is_set():
+                self.q.put(("done", 1)); return             # user Stopped: don't cry "RealityScan error"
+            if rc == 0 and os.path.isfile(save_to):
                 self.q.put(("log", f"\ndone. corrected project -> {save_to}\n"
                                    f"Open it in RealityScan; the cameras sit on the LiDAR.\n"))
+                self.q.put(("done", 0))
             else:
-                self.q.put(("log", f"\nRealityScan exited {rc}. Check the .exe path and that the "
-                                   f".xmp are next to the photos.\n"))
-            self.q.put(("done", 0 if rc == 0 else 1))
+                self.q.put(("log", f"\nRealityScan exited {rc} and no project landed at {save_to}.\n"
+                                   f"Check the .exe path and that the .xmp are next to the photos.\n"))
+                self.q.put(("done", 1))
         except Exception:
             self.q.put(("log", "\n" + traceback.format_exc()))
             self.q.put(("done", 1))
