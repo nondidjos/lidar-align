@@ -11,8 +11,10 @@ Target accuracy: centimetre-level point-to-plane fit to the scan over the whole 
 
 ## Scope
 
-**In:** pre-alignment, LiDAR point-to-plane refinement, QA, RealityScan XMP export, and SfM
-orchestration (COLMAP/GLOMAP/hloc/GLUEMAP) as a convenience.
+**In:** the RealityScan round-trip (drive its CLI to pull the alignment in as COLMAP and push
+corrected poses back), aligning all RealityScan components in one run, pre-alignment, LiDAR
+point-to-plane refinement, QA, RealityScan XMP export, and SfM orchestration
+(COLMAP/GLOMAP/hloc/GLUEMAP) for when you don't use RealityScan to match.
 
 **Out:** meshing, texturing, dense MVS — those stay in RealityScan/COLMAP. lidar-align only
 fixes pose/scale/drift.
@@ -28,10 +30,12 @@ fixes pose/scale/drift.
 
 ## Pipeline
 
-1. **SfM** — photos → COLMAP sparse model. The hard part for repetitive/fisheye scenes;
-   choice of engine/mapper matters most here.
-2. **Pre-align** — coarse Sim3 onto the scan: manual correspondences or the visual slider tool
-   (reliable), else auto FPFH (fails on repetitive structure + partial overlap).
+1. **Match** — photos → a COLMAP sparse model. Normally RealityScan (it handles fisheye and
+   repeated structure natively, then exports to COLMAP); otherwise COLMAP/GLOMAP/hloc/GLUEMAP
+   here. This is the hard part for repetitive/fisheye scenes.
+2. **Pre-align** — coarse Sim3 onto the scan. RealityScan components georeferenced to the imported
+   scan are already there; otherwise the visual slider tool / manual correspondences (reliable),
+   or auto FPFH (fails on repetitive structure + partial overlap).
 3. **Refine** — point-to-plane bundle adjustment: reuse pycolmap's Ceres problem, add
    `w·n·(X−p)` residuals against local cloud planes under a Huber loss, free gauge so the scan
    sets the frame. Annealed association radius / weight over `outer_iters` rounds.
@@ -39,6 +43,13 @@ fixes pose/scale/drift.
 
 ## Key design decisions
 
+- **RealityScan matches; lidar-align does the metric bend.** RealityScan survives fisheye and
+  repetition where COLMAP/hloc/GLUEMAP/VGGT (all pinhole-trained) fail, so it owns the matching.
+  The GUI drives its CLI: Pull exports the alignment to COLMAP, Send re-imports the corrected
+  poses — no hand-driven export/import menus.
+- **All components in one run.** RealityScan splits hard scenes into components; those already in
+  the scan's frame are refined automatically, unbound ones get a manual placement window. No
+  per-component runs, no fragile auto-scale/FPFH on this path.
 - **Native multithreaded LiDAR cost.** The point-to-plane term is a native `NormalPrior`
   (anisotropic: stiff along the normal, weak in-plane), not a Python cost — so the whole solve
   runs on every core. This is what lets the model keep ~800k points instead of a tiny subset.
@@ -57,9 +68,14 @@ fixes pose/scale/drift.
 
 ## Status & known gaps
 
-- **The gate is SfM quality.** A broken sparse cloud (repetitive/fisheye matching failure)
-  can't be aligned — hence the **Preview model** button to catch it early. hloc is the current
-  best bet for wide/fisheye.
+- **The RealityScan round-trip is built against the 2.1.1 CLI but unverified on a live install.**
+  Three things to confirm on the first real run: the COLMAP export preset (`exportRegistration`
+  takes a settings `.xml` saved from the GUI — there is no CLI format flag), that it accepts the
+  export directory, and that `-addFolder` re-imports the sidecar `.xmp` as locked poses (else fall
+  back to `addImageWithCalibration` per image).
+- **Without RealityScan, the gate is SfM quality.** A broken sparse cloud (repetitive/fisheye
+  matching failure) can't be aligned — hence the **Preview model** button to catch it early; hloc
+  is the best local bet for wide/fisheye.
 - **COLMAP→RealityScan axis convention** (Y/Z flip) is the usual one but unverified; A/B the
   `xmp_axis_flip` presets if cameras import mirrored.
 - **Rolling shutter** isn't modelled; cull blurry frames.
