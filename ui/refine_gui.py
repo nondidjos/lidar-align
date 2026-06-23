@@ -636,11 +636,13 @@ class App:
         # Photo alignment (SfM)
         sf = ttk.Labelframe(parent, text="Photo alignment (SfM, Step 1)", padding=8)
         sf.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=4)
-        self._combo(sf, 0, "SfM Engine", "sfm_engine", ["COLMAP/GLOMAP", "GLUEMAP"], "COLMAP/GLOMAP",
-                    tip="COLMAP/GLOMAP: standard global mapper using SIFT features; runs on "
-                        "Windows. GLUEMAP: deep-learning hybrid mapper (Linux + CUDA) - install "
-                        "gluemap-demo natively or inside WSL2 and the app runs it via 'wsl'. "
-                        "GLUEMAP ignores the SIFT quality/keypoint options below.")
+        self._combo(sf, 0, "SfM Engine", "sfm_engine", ["COLMAP/GLOMAP", "hloc (learned, GPU)",
+                    "GLUEMAP"], "COLMAP/GLOMAP",
+                    tip="COLMAP/GLOMAP: SIFT features, runs on Windows. hloc: learned features "
+                        "(SuperPoint + LightGlue) on the GPU, native Windows (no WSL) - matches "
+                        "across heavy fisheye distortion + repeated structure where SIFT fails; set "
+                        "the 'hloc Python (torch env)' path below. GLUEMAP: deep-learning mapper "
+                        "(Linux + CUDA via WSL). hloc/GLUEMAP ignore the SIFT options below.")
         self._preset_row(sf, 1)
         self._combo(sf, 2, "Feature quality", "sfm_quality", ["high", "fast"], "fast",
                     tip="fast: GPU SIFT, much faster - the sane default. high: affine-shape + "
@@ -666,6 +668,14 @@ class App:
                         "with geometric verification - far more robust to repetition and fisheye, but "
                         "slower. If your sparse cloud came out as unrecognizable noise, switch to "
                         "Incremental and rebuild. (COLMAP/GLOMAP only)")
+        self._path_row(sf, 8, "hloc Python (torch env)", "sfm_hloc_python", "", "file",
+                       [("python.exe", "python.exe"), ("All", "*.*")],
+                       tip="Only for SfM Engine = hloc. The python.exe of a venv that has torch + "
+                           "hloc installed (no WSL):  python -m venv hloc-env; hloc-env\\Scripts\\"
+                           "activate; pip install torch torchvision --index-url "
+                           "https://download.pytorch.org/whl/cu124; pip install "
+                           "git+https://github.com/cvg/Hierarchical-Localization.git . Point this at "
+                           "hloc-env\\Scripts\\python.exe.")
         self._path_row(sf, 6, "GLUEMAP config (optional)", "sfm_gluemap_config", "", "file",
                        [("YAML config", "*.yaml *.yml"), ("All", "*.*")],
                        tip="Optional YAML configuration file for GLUEMAP (e.g. configs/example.yaml). "
@@ -914,6 +924,22 @@ class App:
             self._start(f"running SfM (GLUEMAP via {mode})…", self._sfm_worker, (args,))
             return
 
+        if engine.startswith("hloc"):
+            hp = self.var["sfm_hloc_python"].get().strip()
+            if not hp or not os.path.isfile(self._abs(hp)):
+                return messagebox.showerror(
+                    "hloc Python not set",
+                    "Set 'hloc Python (torch env)' to the python.exe of a venv that has torch + hloc "
+                    "installed (no WSL). See that field's tooltip for the two pip commands.")
+            args = dict(
+                engine="hloc", hloc_python=self._abs(hp),
+                images=photos, sparse=p["sparse"], project=p["project"],
+                camera=_CAMERA_MODEL[self.var["camera"].get()],
+            )
+            self._start("running SfM (hloc: SuperPoint + LightGlue on the GPU)…",
+                        self._sfm_worker, (args,))
+            return
+
         self._update_colmap_banner()
         if not self._colmap_exe:
             return messagebox.showerror(
@@ -996,6 +1022,26 @@ class App:
                 if not self._has_model(model):
                     self.q.put(("log", "\nGLUEMAP exited 0 but no COLMAP model (points3D.bin/"
                                        ".txt) was found under the project folder.\n"))
+                    return self.q.put(("done", 1))
+                self.q.put(("log", f"\nSfM complete -> {model}\n"))
+                return self.q.put(("done", 0))
+
+            if a.get("engine") == "hloc":
+                # learned SfM (SuperPoint + LightGlue) via the bundled run_hloc.py, run by the user's
+                # torch venv. Writes a COLMAP model to <project>/sparse/0 (same layout COLMAP uses),
+                # so Step 2 reads it back through the normal model finder.
+                script = _resource("scripts/run_hloc.py")
+                cam = "OPENCV_FISHEYE" if a["camera"] == "OPENCV_FISHEYE" else "OPENCV"
+                cmd = [a["hloc_python"], script, "--images", a["images"],
+                       "--output", a["project"], "--camera-model", cam]
+                self.q.put(("log", f"$ {os.path.basename(a['hloc_python'])} run_hloc.py "
+                                   f"--camera-model {cam} …\n"))
+                if not run(cmd, "hloc (SuperPoint + LightGlue)"):
+                    return self.q.put(("done", 1))
+                model = self._find_model_dir(a["project"])
+                if not self._has_model(model):
+                    self.q.put(("log", "\nhloc exited 0 but no COLMAP model was found under the "
+                                       "project folder.\n"))
                     return self.q.put(("done", 1))
                 self.q.put(("log", f"\nSfM complete -> {model}\n"))
                 return self.q.put(("done", 0))
