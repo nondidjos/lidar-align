@@ -30,12 +30,11 @@ The corrected poses land as `.xmp` sidecars next to your photos, in the scan's o
 
 ## Without RealityScan
 
-You don't have to use RealityScan for the matching. Point lidar-align at any COLMAP sparse model
-(or build one here with COLMAP / GLOMAP / hloc / GLUEMAP), give it a reference cloud, and align:
+You don't have to use the round-trip. Point **"Existing model"** at any COLMAP sparse model (from
+RealityScan, COLMAP, or anywhere else), give it a reference cloud, and align directly:
 
-- **Build model** runs SfM on a photo folder. For wide/fisheye, use the hloc engine or the
-  Incremental mapper.
-- **Preview model** opens the cloud in 3D — if it's noise, the SfM failed; fix that first.
+- **Preview model** opens the model in 3D — if it's noise, the matching failed upstream; fix that
+  before aligning.
 - **Align to cloud** does the bend. For repetitive scenes where auto-scale can't lock, click
   **Align visually** and place it with the sliders first.
 
@@ -59,15 +58,14 @@ defaults are sized for a strong workstation.
 
 ## Install
 
-Python 3.10+ and COLMAP on PATH; the rest is pip.
+Python 3.10+; the rest is pip.
 
 ```bash
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 ```
 
-COLMAP is a separate download (the GUI can fetch it). GLOMAP ships inside COLMAP 4.x. The
-RealityScan round-trip needs RealityScan 2.1+.
+The RealityScan round-trip needs RealityScan 2.1+ (it drives RealityScan's CLI).
 
 ## Build (standalone exe)
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 """Desktop GUI for lidar-align.
 
-One window, two actions:
-  Build model   runs COLMAP + GLOMAP on a photo folder to make a sparse camera model.
-  Align         bends that model onto the LiDAR cloud and writes RealityScan XMP poses.
+Takes a COLMAP sparse model (normally a RealityScan export) and a LiDAR cloud, bends the model
+onto the cloud, and writes corrected RealityScan XMP poses. Pull/Send drive RealityScan's CLI for
+the round-trip; Align components handles a multi-component export in one run.
 
-You give three paths (photos, LiDAR, project folder); everything else is derived under the
-project folder. Advanced knobs are hidden until you open them.
+You give the paths (photos, LiDAR, project folder); everything else is derived under the project
+folder. Advanced knobs are hidden until you open them.
 
 Run:    .venv\\Scripts\\python ui\\refine_gui.py      (or run_gui.bat)
 Frozen: lidar-align.exe --selftest
@@ -20,14 +20,11 @@ import io
 import json
 import queue
 import shutil
-import ssl
 import subprocess
 import sys
 import threading
 import time
 import traceback
-import urllib.request
-import zipfile
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -40,106 +37,10 @@ else:
     if ROOT not in sys.path:
         sys.path.insert(0, ROOT)
 
-# Friendly camera names -> COLMAP camera_model. OPENCV covers most lenses; fisheye for
-# action cams / very wide; simple radial for a quick single-parameter fit.
-CAMERAS = [
-    ("Standard lens", "OPENCV"),
-    ("Wide / action cam (fisheye)", "OPENCV_FISHEYE"),
-    ("Simple (single distortion term)", "SIMPLE_RADIAL"),
-]
-_CAMERA_MODEL = dict(CAMERAS)
-
-# SfM speed/quality presets -> (feature quality, max features, frames matched ahead).
-# Grounded in COLMAP's own quality tiers: plain GPU SIFT (no affine/DSP) is the norm;
-# DSP-SIFT/affine is the slow CPU "max" path COLMAP reserves for hard cases.
-_SFM_PRESETS = {
-    "Fast (low RAM)":     ("fast", 2048, 5),
-    "Balanced":           ("fast", 4096, 10),
-    "High detail":        ("fast", 8192, 10),
-    "Max quality (slow)": ("high", 8192, 15),
-}
-_SFM_PRESET_NAMES = list(_SFM_PRESETS) + ["Custom"]
-
-_COLMAP_LOCAL_DIR = os.path.join(os.environ.get("APPDATA", ROOT), "lidar-align", "colmap")
 _SETTINGS_FILE = os.path.join(os.environ.get("APPDATA", ROOT), "lidar-align", "gui_settings.json")
 # Cap the on-screen log: an unbounded Text widget gets progressively slower to insert into and
-# scroll, which is what makes the window go "Not Responding" on long, chatty runs (6h COLMAP).
+# scroll, which is what makes the window go "Not Responding" on long, chatty runs.
 _LOG_MAX_LINES = 5000
-
-
-def _ssl_context():
-    """A TLS context that VERIFIES certificates (certifi bundle if present, else the system
-    store). We download and then run colmap.exe, so never disable verification."""
-    try:
-        import certifi
-        return ssl.create_default_context(cafile=certifi.where())
-    except Exception:
-        return ssl.create_default_context()
-
-
-def _colmap_help(colmap, cmd):
-    """Return the `colmap <cmd> -h` text, so we can pick option names that match the
-    installed COLMAP. (4.0 renamed e.g. SiftExtraction.use_gpu -> FeatureExtraction.use_gpu;
-    probing the actual binary avoids guessing per version.)"""
-    try:
-        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        r = subprocess.run([colmap, cmd, "-h"], capture_output=True, text=True,
-                           timeout=30, creationflags=flags)
-        return (r.stdout or "") + (r.stderr or "")
-    except Exception:
-        return ""
-
-
-def _resolve(help_text, *candidates):
-    """First candidate option present in help_text; falls back to the first (best effort
-    when help is unavailable). Use for options that must be passed."""
-    for c in candidates:
-        if c in help_text:
-            return c
-    return candidates[0]
-
-
-def _present(help_text, *candidates):
-    """First candidate present in help_text, or None when help is non-empty and none match
-    (so optional flags can be skipped rather than rejected)."""
-    if not help_text:
-        return candidates[0]
-    for c in candidates:
-        if c in help_text:
-            return c
-    return None
-
-
-def _find_colmap():
-    """colmap.exe from PATH first, then our managed local install."""
-    found = shutil.which("colmap")
-    if found:
-        return found
-    for c in (os.path.join(_COLMAP_LOCAL_DIR, "bin", "colmap.exe"),
-              os.path.join(_COLMAP_LOCAL_DIR, "colmap.exe")):
-        if os.path.isfile(c):
-            return c
-    if os.path.isdir(_COLMAP_LOCAL_DIR):
-        for d, _, files in os.walk(_COLMAP_LOCAL_DIR):
-            if "colmap.exe" in files:
-                return os.path.join(d, "colmap.exe")
-    return None
-
-
-def _latest_colmap_windows_url():
-    """(url, filename) for the latest Windows COLMAP zip (CUDA preferred)."""
-    api = "https://api.github.com/repos/colmap/colmap/releases/latest"
-    req = urllib.request.Request(api, headers={"User-Agent": "lidar-align-gui"})
-    with urllib.request.urlopen(req, timeout=15, context=_ssl_context()) as r:
-        data = json.loads(r.read())
-    assets = data.get("assets", [])
-    cuda = [a for a in assets if "windows" in a["name"].lower()
-            and "cuda" in a["name"].lower() and a["name"].endswith(".zip")]
-    win = [a for a in assets if "windows" in a["name"].lower() and a["name"].endswith(".zip")]
-    chosen = cuda or win
-    if not chosen:
-        raise RuntimeError("No Windows COLMAP zip in the latest GitHub release.")
-    return chosen[0]["browser_download_url"], chosen[0]["name"]
 
 
 class _QueueWriter(io.TextIOBase):
@@ -207,66 +108,10 @@ def _validate_images_dir(images_dir, sparse_out):
             print(f"    … and {len(missing) - 10} more")
 
 
-def _resource(rel):
-    """Resolve a repo resource path, working both from source and from a PyInstaller bundle."""
-    parts = rel.split("/")
-    base = getattr(sys, "_MEIPASS", ROOT)
-    p = os.path.join(base, *parts)
-    return p if os.path.exists(p) else os.path.join(ROOT, *parts)
-
-
-def _winpath_to_wsl(p):
-    """C:\\Users\\x -> /mnt/c/Users/x, so a Windows path can be handed to a WSL command."""
-    p = os.path.abspath(p)
-    drive, rest = os.path.splitdrive(p)
-    if drive:
-        return "/mnt/" + drive[0].lower() + rest.replace("\\", "/")
-    return p.replace("\\", "/")
-
-
-def _find_gluemap():
-    """Locate gluemap-demo (Linux+CUDA tool). Returns (mode, exe):
-       ('win', path)  native Windows exe on PATH (rare),
-       ('wsl', name)  found inside WSL -> run as `wsl <name> ...`,
-       (None, None)   not found."""
-    for name in ("gluemap-demo", "gluemap"):
-        p = shutil.which(name)
-        if p:
-            return "win", p
-    if shutil.which("wsl"):
-        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        try:
-            # run as root (no Linux user/password); the installer drops the wrapper at
-            # /root/.local/bin/gluemap-demo - test that path directly so PATH config can't hide it.
-            r = subprocess.run(["wsl", "-u", "root", "bash", "-lc",
-                                'test -x "$HOME/.local/bin/gluemap-demo" || command -v gluemap-demo'],
-                               capture_output=True, text=True, timeout=25, creationflags=flags)
-            if r.returncode == 0:
-                return "wsl", "gluemap-demo"
-        except Exception:
-            pass
-    return None, None
-
-
-def _wsl_ready():
-    """True only if WSL has a usable Linux distro. `wsl.exe` ships with Windows even when no
-    distro is installed, so checking for the launcher isn't enough - actually run a no-op."""
-    if not shutil.which("wsl"):
-        return False
-    try:
-        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        # as root: no Linux user/password needed, and it skips the first-run user-creation prompt.
-        r = subprocess.run(["wsl", "-u", "root", "-e", "true"], capture_output=True, timeout=20,
-                           creationflags=flags)
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
 def _kill_tree(proc):
-    """Kill a subprocess AND its children. colmap can spawn workers, and on Windows
-    Popen.terminate() only kills the parent - so Stop / window-close use taskkill /T to avoid
-    orphaned colmap.exe. Also unblocks a reader stuck on a quiet child's stdout."""
+    """Kill a subprocess AND its children. A child (RealityScan, a viewer) can spawn workers, and on
+    Windows Popen.terminate() only kills the parent - so Stop / window-close use taskkill /T to avoid
+    orphans. Also unblocks a reader stuck on a quiet child's stdout."""
     if proc is None or proc.poll() is not None:
         return
     try:
@@ -313,7 +158,6 @@ class App:
         self.q = queue.Queue()
         self._worker = None
         self._cancel = threading.Event()
-        self._colmap_exe = _find_colmap()
         self.var = {}            # key -> tk variable
         self._adv_open = False
         self._throb_state = 0
@@ -321,7 +165,6 @@ class App:
         self._last_beat = 0.0       # last heartbeat-to-log time
         self._last_output = 0.0     # last time a log line arrived (quiet detection)
         self._proc = None           # current subprocess, so Stop / close can kill it
-        self._chain = None          # (refine_kwargs, images_dir, project): auto-align after Build
         self._build()
         self._load_settings()
         self.root.after(100, self._drain)
@@ -347,8 +190,6 @@ class App:
                     self.var[k].set(val)
                 except Exception:
                     pass
-        if "sfm_preset" not in data:   # settings saved before presets -> reset SfM to the sane default
-            self._apply_preset()
 
     def _save_settings(self):
         try:
@@ -442,20 +283,16 @@ class App:
         inp = ttk.Labelframe(top, text="Project", padding=10)
         inp.grid(row=0, column=0, sticky="ew")
         self._path_row(inp, 0, "Photos folder", "photos", "data/images", "dir",
-                       tip="Folder of input photos for Step 1 (building the camera model). "
-                           "Leave blank if you already have a model and only want to align.")
+                       tip="Folder of the photos behind the model. The corrected .xmp pose sidecars "
+                           "are written here for RealityScan. Needed for the RealityScan 'Send'.")
         self._path_row(inp, 1, "Reference cloud (.las / .laz / .e57)", "lidar",
                        "data/lidar.laz", "file",
                        [("Point cloud", "*.las *.laz *.e57 *.ply *.pcd"), ("All", "*.*")],
                        tip="The point cloud to align to - usually a LiDAR/survey scan, but any "
                            "registered cloud works. Its coordinate frame becomes the target.")
         self._path_row(inp, 2, "Project folder (output goes here)", "project", "data/sfm", "dir",
-                       tip="Working folder. The camera model, aligned result, QA clouds and the "
-                           "COLMAP database are all written under here.")
-        self._combo(inp, 3, "Camera type", "camera", [c[0] for c in CAMERAS], CAMERAS[0][0],
-                    tip="Lens type of your photos. Standard suits most cameras and phones; "
-                        "fisheye for very wide or action cams; simple is a quick single-"
-                        "distortion fit.")
+                       tip="Working folder. The aligned model, QA clouds, and the RealityScan "
+                           "export/import staging are all written under here.")
 
         # Advanced toggle + frame
         self._adv_btn = ttk.Button(top, text="▸ Advanced settings", command=self._toggle_adv)
@@ -468,12 +305,8 @@ class App:
         # Action bar
         bar = ttk.Frame(top)
         bar.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        self.all_btn = ttk.Button(bar, text="▶ Build + Align (all)", command=self.run_all)
-        self.all_btn.pack(side="left")
-        self.sfm_btn = ttk.Button(bar, text="1. Build model", command=self.sfm_run)
-        self.sfm_btn.pack(side="left", padx=(6, 0))
-        self.refine_btn = ttk.Button(bar, text="2. Align to cloud", command=self.refine_run)
-        self.refine_btn.pack(side="left", padx=(6, 0))
+        self.refine_btn = ttk.Button(bar, text="Align to cloud", command=self.refine_run)
+        self.refine_btn.pack(side="left")
         self.multi_btn = ttk.Button(bar, text="Align components", command=self.align_components_run)
         self.multi_btn.pack(side="left", padx=(6, 0))
         _Tip(self.multi_btn,
@@ -491,16 +324,16 @@ class App:
         self.preview_btn = ttk.Button(bar, text="Preview model", command=self.preview_model_run)
         self.preview_btn.pack(side="left", padx=(6, 0))
         _Tip(self.preview_btn,
-             "Open the built SfM model in 3D to check it's RECOGNIZABLE before aligning. If it's "
-             "noise (no recognizable structure), step 1 failed - no alignment can fix that, so fix "
-             "the SfM first (switch Mapper to Incremental, or SfM Engine to hloc for wide/fisheye).")
+             "Open the model in 3D to check it's RECOGNIZABLE before aligning. If it's noise (no "
+             "recognizable structure), the matching failed upstream - no alignment can fix that, so "
+             "fix it in RealityScan first.")
         self.align_vis_btn = ttk.Button(bar, text="Align visually", command=self.align_visual_run)
         self.align_vis_btn.pack(side="left", padx=(6, 0))
         _Tip(self.align_vis_btn,
              "When auto-align can't lock the scale (stairs / repeated structure + partial overlap), "
-             "open a 3D window to place it by hand: +/- to scale the orange model onto the gray scan, "
-             "WASD/RF to move, QE/ZX to rotate, drag-mouse to look, ENTER to accept. Then click "
-             "'2. Align to cloud' - it uses your placement and just polishes from there.")
+             "open a 3D window to place it by hand: scale/rotate/move the orange model onto the gray "
+             "scan, then Accept. Then click 'Align to cloud' - it uses your placement and polishes "
+             "from there.")
         self.dedup_btn = ttk.Button(bar, text="Merge scans", command=self.dedup_run)
         self.dedup_btn.pack(side="left", padx=(6, 0))
         _Tip(self.dedup_btn,
@@ -516,18 +349,6 @@ class App:
         self.status_text.pack(side="right", padx=(0, 2))
         self.status_throb = ttk.Label(bar, text="")
         self.status_throb.pack(side="right")
-
-        # COLMAP status line
-        cb = ttk.Frame(top)
-        cb.grid(row=4, column=0, sticky="ew", pady=(4, 0))
-        self._colmap_lbl = ttk.Label(cb, text="")
-        self._colmap_lbl.pack(side="left")
-        self._colmap_dl_btn = ttk.Button(cb, text="⬇ Download COLMAP",
-                                         command=self._colmap_download)
-        self._gluemap_btn = ttk.Button(cb, text="⬇ Install GLUEMAP (WSL)",
-                                       command=self._gluemap_install)
-        self._gluemap_btn.pack(side="right")
-        self._update_colmap_banner()
 
         # Log
         ttk.Label(top, text="Log").grid(row=5, column=0, sticky="w", pady=(8, 0))
@@ -641,60 +462,11 @@ class App:
                     ["", "rc_default", "identity", "flip_xz", "flip_xy"], "",
                     tip="Coordinate-axis convention for RealityScan. Leave blank unless imported "
                         "cameras look mirrored or upside-down, then try the presets.")
-        self._path_row(out, 5, "Existing model (skip Step 1)", "model_override", "", "dir",
-                       tip="Point straight at an existing COLMAP/GLOMAP/GLUEMAP model folder (sparse/0) "
-                           "to skip building one. Perfect for using models pre-built with GLUEMAP, or "
-                           "for a RealityScan export. For 'Align components' point at the PARENT folder "
-                           "holding the component subfolders (e.g. the sparse/ that contains 0/, 1/, …) "
-                           "- it finds them all. Blank = use the model Step 1 makes.")
-
-        # Photo alignment (SfM)
-        sf = ttk.Labelframe(parent, text="Photo alignment (SfM, Step 1)", padding=8)
-        sf.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=4)
-        self._combo(sf, 0, "SfM Engine", "sfm_engine", ["COLMAP/GLOMAP", "hloc (learned, GPU)",
-                    "GLUEMAP"], "COLMAP/GLOMAP",
-                    tip="COLMAP/GLOMAP: SIFT features, runs on Windows. hloc: learned features "
-                        "(SuperPoint + LightGlue) on the GPU, native Windows (no WSL) - matches "
-                        "across heavy fisheye distortion + repeated structure where SIFT fails; set "
-                        "the 'hloc Python (torch env)' path below. GLUEMAP: deep-learning mapper "
-                        "(Linux + CUDA via WSL). hloc/GLUEMAP ignore the SIFT options below.")
-        self._preset_row(sf, 1)
-        self._combo(sf, 2, "Feature quality", "sfm_quality", ["high", "fast"], "fast",
-                    tip="fast: GPU SIFT, much faster - the sane default. high: affine-shape + "
-                        "DSP-SIFT, more matches but CPU-only and very slow on many photos; only "
-                        "for genuinely hard / low-texture sets. (COLMAP/GLOMAP only)")
-        self._spin(sf, 3, "Keypoints per photo", "sfm_max_feats", 1024, 32768, 4096, inc=1024,
-                   tip="Features per photo. More = denser matches + bigger database + more RAM "
-                       "and time in the mapper. 2048-4096 is plenty for high-overlap video; 8192 "
-                       "only for sparse / low-texture sets. (COLMAP/GLOMAP only)")
-        self._spin(sf, 4, "Frames matched ahead", "sfm_overlap", 1, 50, 10,
-                   tip="For ordered photos/video: how many neighbouring frames each photo is "
-                       "matched against. Higher is more robust to fast motion; slower. (COLMAP/GLOMAP only)")
-        self._path_row(sf, 5, "Loop-closure file (optional)", "sfm_vocab", "", "file",
-                       [("Vocab tree", "*.bin"), ("All", "*.*")],
-                       tip="Optional COLMAP vocabulary-tree .bin file that lets it recognise when "
-                           "the camera revisits the same place (loop closure). (COLMAP/GLOMAP only)")
-        self._combo(sf, 7, "Mapper (COLMAP)", "sfm_mapper",
-                    ["Incremental (robust)", "GLOMAP global (fast)"], "Incremental (robust)",
-                    tip="How COLMAP turns matches into a model. Incremental (default): adds cameras "
-                        "one at a time with geometric verification - robust to REPEATED structure "
-                        "(stairs, railings, balusters) and wide/fisheye lenses, the usual subjects "
-                        "here; slower but reliable. GLOMAP global: faster, but on repeated or fisheye "
-                        "scenes it matches the wrong repeats and folds the reconstruction into noise "
-                        "(the 'matrix not positive definite' warnings) - only pick it for easy, "
-                        "well-textured, non-repetitive sets. (COLMAP/GLOMAP only)")
-        self._path_row(sf, 8, "hloc Python (torch env)", "sfm_hloc_python", "", "file",
-                       [("python.exe", "python.exe"), ("All", "*.*")],
-                       tip="Only for SfM Engine = hloc. The python.exe of a venv that has torch + "
-                           "hloc installed (no WSL):  python -m venv hloc-env; hloc-env\\Scripts\\"
-                           "activate; pip install torch torchvision --index-url "
-                           "https://download.pytorch.org/whl/cu124; pip install "
-                           "git+https://github.com/cvg/Hierarchical-Localization.git . Point this at "
-                           "hloc-env\\Scripts\\python.exe.")
-        self._path_row(sf, 6, "GLUEMAP config (optional)", "sfm_gluemap_config", "", "file",
-                       [("YAML config", "*.yaml *.yml"), ("All", "*.*")],
-                       tip="Optional YAML configuration file for GLUEMAP (e.g. configs/example.yaml). "
-                           "If blank, GLUEMAP uses its default settings.")
+        self._path_row(out, 5, "Existing model (COLMAP)", "model_override", "", "dir",
+                       tip="The COLMAP sparse model to align - normally a RealityScan export (use "
+                           "'Pull from RealityScan' to make one), or any COLMAP sparse/0 folder. For "
+                           "'Align components' point at the PARENT folder holding the component "
+                           "subfolders (e.g. the sparse/ that contains 0/, 1/, …) - it finds them all.")
 
         # RealityScan round-trip: drive RealityScan's CLI to pull the alignment in (as COLMAP) and
         # push the corrected poses back out (as XMP), so you never touch its export/import menus.
@@ -732,28 +504,6 @@ class App:
              "builds a fresh RealityScan project from those photos with the corrected poses baked "
              "in (RealityScan reads the .xmp sitting next to each image). Optionally meshes it.")
 
-    def _preset_row(self, parent, row):
-        self._label_with_tip(
-            parent, row, "Speed / quality preset",
-            "A starting point for the SfM knobs below. Fast = small database + low RAM; "
-            "Balanced = the sane default; High detail = 8192 features; Max quality = affine/DSP "
-            "on CPU (very slow). Tweak the knobs after picking, or choose Custom to leave them.")
-        var = tk.StringVar(value="Balanced")
-        self.var["sfm_preset"] = var
-        cb = ttk.Combobox(parent, textvariable=var, state="readonly", width=22,
-                          values=_SFM_PRESET_NAMES)
-        cb.grid(row=row, column=1, sticky="w")
-        cb.bind("<<ComboboxSelected>>", lambda e: self._apply_preset())
-
-    def _apply_preset(self):
-        p = _SFM_PRESETS.get(self.var["sfm_preset"].get())
-        if not p:            # "Custom" -> leave the knobs untouched
-            return
-        q, feats, ov = p
-        self.var["sfm_quality"].set(q)
-        self.var["sfm_max_feats"].set(str(feats))
-        self.var["sfm_overlap"].set(str(ov))
-
     def _toggle_adv(self):
         self._adv_open = not self._adv_open
         if self._adv_open:
@@ -772,9 +522,8 @@ class App:
         return any(os.path.isfile(os.path.join(d, f"points3D.{e}")) for e in ("bin", "txt"))
 
     def _find_model_dir(self, proj, override=""):
-        """Locate the COLMAP model folder. COLMAP/GLOMAP write <proj>/sparse/0; GLUEMAP's
-        layout under --write_path isn't fixed, so fall back to a shallow search for the
-        folder that actually holds points3D.bin/.txt."""
+        """Locate the COLMAP model folder. Exports usually land at <proj>/sparse/0; fall back to a
+        shallow search for the folder that actually holds points3D.bin/.txt."""
         if override:
             return self._abs(override)
         for c in (os.path.join(proj, "sparse", "0"), os.path.join(proj, "sparse"), proj):
@@ -791,404 +540,11 @@ class App:
         override = self.var["model_override"].get().strip()
         return {
             "project": proj,
-            "db": os.path.join(proj, "database.db"),
             "sparse": os.path.join(proj, "sparse"),
             "sparse_in": self._find_model_dir(proj, override),
             "sparse_out": os.path.join(proj, "sparse_refined"),
             "qa": os.path.join(proj, "qa"),
         }
-
-    # ── COLMAP banner / download ────────────────────────────────────────────────
-    def _update_colmap_banner(self):
-        self._colmap_exe = _find_colmap()
-        if self._colmap_exe:
-            self._colmap_lbl.config(text=f"COLMAP: {self._colmap_exe}", foreground="#1a7a1a")
-            self._colmap_dl_btn.pack_forget()
-        else:
-            self._colmap_lbl.config(text="COLMAP not found (needed for Step 1).",
-                                    foreground="#b00000")
-            self._colmap_dl_btn.pack(side="left", padx=(10, 0))
-
-    def _install_wsl(self):
-        """Run `wsl --install` elevated (UAC). Needs a reboot to finish."""
-        if sys.platform != "win32":
-            return messagebox.showerror("Unsupported", "WSL is Windows-only.")
-        try:
-            import ctypes
-            params = ('-NoProfile -ExecutionPolicy Bypass -Command '
-                      '"wsl --install; Read-Host \'WSL install finished - press Enter to close\'"')
-            rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe",
-                                                     params, None, 1)
-            if rc <= 32:
-                return messagebox.showerror(
-                    "Elevation declined",
-                    "Couldn't start the elevated installer (UAC declined). Run 'wsl --install' "
-                    "in an admin PowerShell yourself.")
-            messagebox.showinfo(
-                "Installing WSL",
-                "WSL is installing in the elevated window. When it finishes:\n"
-                "1. Reboot Windows.\n"
-                "2. Open Ubuntu once and set a username/password.\n"
-                "3. Click 'Install GLUEMAP (WSL)' again.")
-        except Exception as e:
-            messagebox.showerror("WSL install failed", str(e))
-
-    def _gluemap_install(self):
-        if self._worker and self._worker.is_alive():
-            return messagebox.showwarning("Busy", "A job is already running.")
-        if not _wsl_ready():
-            if messagebox.askokcancel(
-                    "Install WSL",
-                    "WSL isn't installed. I can run 'wsl --install' now - it needs admin (a UAC "
-                    "prompt) and a reboot to finish.\n\nAfter rebooting, open Ubuntu once to set a "
-                    "username, then click Install GLUEMAP again. (GLUEMAP also needs an NVIDIA "
-                    "CUDA GPU.)\n\nInstall WSL now?"):
-                self._install_wsl()
-            return
-        if not messagebox.askokcancel(
-                "Install GLUEMAP",
-                "This builds GLUEMAP inside WSL and downloads a CUDA PyTorch build plus several "
-                "GB of model weights. It takes a while and needs an NVIDIA GPU.\n\nProceed?"):
-            return
-        self._cancel.clear()
-        self._clear_log()
-        self.all_btn.config(state="disabled")
-        self.sfm_btn.config(state="disabled")
-        self.refine_btn.config(state="disabled")
-        self._gluemap_btn.config(state="disabled", text="Installing GLUEMAP…")
-        self.status_text.config(text="installing GLUEMAP…")
-        self._worker = threading.Thread(target=self._gluemap_install_worker, daemon=True)
-        self._worker.start()
-
-    def _gluemap_install_worker(self):
-        try:
-            script = _resource("scripts/install_gluemap.sh")
-            if not os.path.isfile(script):
-                self.q.put(("log", f"installer not found: {script}\n"))
-                return self.q.put(("done", 1))
-            wsl_script = _winpath_to_wsl(script)
-            # run as root (no Linux user/password): the installer uses micromamba (no sudo), so root
-            # works and skips the Ubuntu first-run user-creation prompt. strip CR (Windows checkout).
-            cmd = ["wsl", "-u", "root", "bash", "-lc", 'tr -d "\\r" < "$1" | bash -ls', "_", wsl_script]
-            self.q.put(("log", f"$ wsl -u root bash {wsl_script}\n\n"))
-            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, bufsize=1, creationflags=flags)
-            self._proc = proc
-            for line in proc.stdout:
-                self.q.put(("log", line))
-                if self._cancel.is_set():
-                    _kill_tree(proc)
-                    break
-            proc.wait()
-            self._proc = None
-            self.q.put(("done", proc.returncode))
-        except Exception:
-            self.q.put(("log", "\n" + traceback.format_exc()))
-            self.q.put(("done", 1))
-
-    def _colmap_download(self):
-        if self._worker and self._worker.is_alive():
-            return messagebox.showwarning("Busy", "A job is already running.")
-        self._cancel.clear()
-        self._colmap_dl_btn.config(state="disabled", text="Downloading…")
-        self.all_btn.config(state="disabled")
-        self.sfm_btn.config(state="disabled")
-        self.refine_btn.config(state="disabled")
-        self._clear_log()
-        self._worker = threading.Thread(target=self._colmap_dl_worker, daemon=True)
-        self._worker.start()
-
-    def _colmap_dl_worker(self):
-        try:
-            with contextlib.redirect_stdout(_QueueWriter(self.q)):
-                print("Looking up the latest COLMAP release…")
-                url, fname = _latest_colmap_windows_url()
-                print(f"Downloading {fname}\n  {url}")
-                os.makedirs(_COLMAP_LOCAL_DIR, exist_ok=True)
-                zip_path = os.path.join(_COLMAP_LOCAL_DIR, fname)
-                req = urllib.request.Request(url, headers={"User-Agent": "lidar-align-gui"})
-                with urllib.request.urlopen(req, timeout=60, context=_ssl_context()) as resp, \
-                        open(zip_path, "wb") as out:
-                    total = int(resp.headers.get("Content-Length", 0))
-                    done = last = 0
-                    while True:
-                        chunk = resp.read(1 << 16)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                        done += len(chunk)
-                        if total and done * 100 // total != last:
-                            last = done * 100 // total
-                            self.q.put(("log", f"\r  {last}%  "))
-                print("\nExtracting…")
-                with zipfile.ZipFile(zip_path) as zf:
-                    zf.extractall(_COLMAP_LOCAL_DIR)
-                os.remove(zip_path)
-                found = None
-                for d, _, files in os.walk(_COLMAP_LOCAL_DIR):
-                    if "colmap.exe" in files:
-                        found = os.path.join(d, "colmap.exe"); break
-                if found:
-                    print(f"COLMAP installed -> {found}")
-                    self.q.put(("colmap_installed", found))
-                else:
-                    print("ERROR: colmap.exe not found after extraction.")
-                    self.q.put(("done", 1))
-        except Exception:
-            self.q.put(("log", "\n" + traceback.format_exc()))
-            self.q.put(("done", 1))
-
-    # ── Step 1: SfM ─────────────────────────────────────────────────────────────
-    def sfm_run(self):
-        if self._worker and self._worker.is_alive():
-            return messagebox.showwarning("Busy", "A job is already running.")
-        photos = self.var["photos"].get().strip()
-        if not photos:
-            return messagebox.showerror("Missing input", "Photos folder is required for Step 1.")
-        photos = self._abs(photos)
-        if not os.path.isdir(photos):
-            return messagebox.showerror("Not found", f"Photos folder not found:\n{photos}")
-
-        engine = self.var["sfm_engine"].get()
-        p = self._paths()
-
-        if engine == "GLUEMAP":
-            mode, gluemap_exe = _find_gluemap()
-            if not gluemap_exe:
-                return messagebox.showerror(
-                    "GLUEMAP not found",
-                    "gluemap-demo was not found on PATH or inside WSL.\n\n"
-                    "GLUEMAP needs Linux + a CUDA GPU. On Windows, install it inside WSL2 "
-                    "(with the NVIDIA CUDA driver); the app will run it as 'wsl gluemap-demo'.")
-            cfg_raw = self.var["sfm_gluemap_config"].get().strip()
-            # Validate the optional config early so we don't launch with a bad path.
-            if cfg_raw and not os.path.isfile(self._abs(cfg_raw)):
-                return messagebox.showerror(
-                    "Bad config", f"GLUEMAP config file not found:\n{cfg_raw}")
-            args = dict(
-                engine="GLUEMAP", mode=mode, gluemap=gluemap_exe,
-                images=photos, sparse=p["sparse"], project=p["project"],
-                config=self._abs(cfg_raw) if cfg_raw else "",
-                fisheye=(_CAMERA_MODEL[self.var["camera"].get()] == "OPENCV_FISHEYE"),
-            )
-            self._start(f"running SfM (GLUEMAP via {mode})…", self._sfm_worker, (args,))
-            return
-
-        if engine.startswith("hloc"):
-            hp = self.var["sfm_hloc_python"].get().strip()
-            if not hp or not os.path.isfile(self._abs(hp)):
-                return messagebox.showerror(
-                    "hloc Python not set",
-                    "Set 'hloc Python (torch env)' to the python.exe of a venv that has torch + hloc "
-                    "installed (no WSL). See that field's tooltip for the two pip commands.")
-            args = dict(
-                engine="hloc", hloc_python=self._abs(hp),
-                images=photos, sparse=p["sparse"], project=p["project"],
-                camera=_CAMERA_MODEL[self.var["camera"].get()],
-            )
-            self._start("running SfM (hloc: SuperPoint + LightGlue on the GPU)…",
-                        self._sfm_worker, (args,))
-            return
-
-        self._update_colmap_banner()
-        if not self._colmap_exe:
-            return messagebox.showerror(
-                "COLMAP not found",
-                "Step 1 needs COLMAP. Click 'Download COLMAP' or install it and add to PATH.")
-
-        try:    # Spinbox text is freely editable; don't pass a bad token to COLMAP
-            max_feats = str(int(self.var["sfm_max_feats"].get().strip() or "4096"))
-            overlap = str(int(self.var["sfm_overlap"].get().strip() or "10"))
-        except ValueError:
-            return messagebox.showerror(
-                "Invalid input", "Max keypoints and Match overlap must be whole numbers.")
-        vocab_raw = self.var["sfm_vocab"].get().strip()
-        args = dict(
-            engine="COLMAP/GLOMAP",
-            images=photos, db=p["db"], sparse=p["sparse"],
-            camera=_CAMERA_MODEL[self.var["camera"].get()],
-            max_feats=max_feats, overlap=overlap,
-            quality=self.var["sfm_quality"].get(),
-            vocab=self._abs(vocab_raw) if vocab_raw else "",
-            colmap=self._colmap_exe,
-            mapper=self.var["sfm_mapper"].get(),
-        )
-        kind = "incremental" if args["mapper"].startswith("Incremental") else "GLOMAP"
-        self._start(f"running SfM (COLMAP + {kind} mapper)…", self._sfm_worker, (args,))
-
-    def _sfm_worker(self, a):
-        def run(cmd, label):
-            self.q.put(("log", f"\n== {label} ==\n"))
-            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, bufsize=1, creationflags=flags)
-            self._proc = proc
-            for line in proc.stdout:
-                self.q.put(("log", line))
-                if self._cancel.is_set():
-                    _kill_tree(proc)        # kills colmap + children, releases the db lock
-                    proc.wait()
-                    self._proc = None
-                    return False
-            proc.wait()
-            self._proc = None
-            if proc.returncode != 0:
-                self.q.put(("log", f"\nERROR: {label} exited {proc.returncode}\n"))
-                return False
-            return True
-
-        try:
-            if a.get("engine") == "GLUEMAP":
-                os.makedirs(a["project"], exist_ok=True)   # gluemap won't create --write_path
-                if a.get("mode") == "wsl":
-                    # run inside WSL as ROOT (no Linux user/password). Call the wrapper by FULL PATH
-                    # ($HOME/.local/bin = /root/.local/bin) so a non-login PATH can't hide it; $HOME
-                    # expands in the shell. gluemap writes to the same on-disk folder, so Step 2
-                    # reads the model back on the Windows side. Windows paths -> /mnt/... .
-                    inner = ('"$HOME/.local/bin/gluemap-demo" --images_path "$1" --write_path "$2" '
-                             '--intrinsics_mode SHARED')
-                    sh_args = ["_", _winpath_to_wsl(a["images"]), _winpath_to_wsl(a["project"])]
-                    if a.get("config"):
-                        inner += ' --config "$3"'
-                        sh_args.append(_winpath_to_wsl(a["config"]))
-                    elif a.get("fisheye"):
-                        # wide/action cam: use the OPENCV_FISHEYE preset the installer wrote (gluemap
-                        # defaults to SIMPLE_PINHOLE, which can't model a fisheye -> noise).
-                        inner += ' --config "$HOME/gluemap/configs/fisheye.yaml"'
-                        self.q.put(("log", "[gluemap] fisheye camera: using OPENCV_FISHEYE preset "
-                                           "(~/gluemap/configs/fisheye.yaml)\n"))
-                    cmd = ["wsl", "-u", "root", "bash", "-lc", inner] + sh_args
-                else:
-                    cmd = [a["gluemap"], "--images_path", a["images"],
-                           "--write_path", a["project"], "--intrinsics_mode", "SHARED"]
-                    if a.get("config"):
-                        cmd += ["--config", a["config"]]
-                    elif a.get("fisheye"):
-                        cmd += ["--config", os.path.expanduser("~/gluemap/configs/fisheye.yaml")]
-                if not run(cmd, f"gluemap ({a.get('mode')})"):
-                    self.q.put(("log", "\nGLUEMAP run failed - see above for details.\n"))
-                    return self.q.put(("done", 1))
-                model = self._find_model_dir(a["project"])   # GLUEMAP layout isn't fixed
-                if not self._has_model(model):
-                    self.q.put(("log", "\nGLUEMAP exited 0 but no COLMAP model (points3D.bin/"
-                                       ".txt) was found under the project folder.\n"))
-                    return self.q.put(("done", 1))
-                self.q.put(("log", f"\nSfM complete -> {model}\n"))
-                return self.q.put(("done", 0))
-
-            if a.get("engine") == "hloc":
-                # learned SfM (SuperPoint + LightGlue) via the bundled run_hloc.py, run by the user's
-                # torch venv. Writes a COLMAP model to <project>/sparse/0 (same layout COLMAP uses),
-                # so Step 2 reads it back through the normal model finder.
-                script = _resource("scripts/run_hloc.py")
-                cam = "OPENCV_FISHEYE" if a["camera"] == "OPENCV_FISHEYE" else "OPENCV"
-                cmd = [a["hloc_python"], script, "--images", a["images"],
-                       "--output", a["project"], "--camera-model", cam]
-                self.q.put(("log", f"$ {os.path.basename(a['hloc_python'])} run_hloc.py "
-                                   f"--camera-model {cam} …\n"))
-                if not run(cmd, "hloc (SuperPoint + LightGlue)"):
-                    return self.q.put(("done", 1))
-                model = self._find_model_dir(a["project"])
-                if not self._has_model(model):
-                    self.q.put(("log", "\nhloc exited 0 but no COLMAP model was found under the "
-                                       "project folder.\n"))
-                    return self.q.put(("done", 1))
-                self.q.put(("log", f"\nSfM complete -> {model}\n"))
-                return self.q.put(("done", 0))
-
-            os.makedirs(a["sparse"], exist_ok=True)
-
-            # COLMAP 4.0 renamed some option namespaces (e.g. SiftExtraction.use_gpu ->
-            # FeatureExtraction.use_gpu). Resolve names against the installed binary's help.
-            fe = _colmap_help(a["colmap"], "feature_extractor")
-            ext_gpu = _resolve(fe, "FeatureExtraction.use_gpu", "SiftExtraction.use_gpu")
-            feat = [a["colmap"], "feature_extractor",
-                    "--database_path", a["db"], "--image_path", a["images"],
-                    "--ImageReader.single_camera", "1",
-                    "--ImageReader.camera_model", a["camera"],
-                    "--SiftExtraction.max_num_features", a["max_feats"]]
-            fisheye_cam = (a["camera"] == "OPENCV_FISHEYE")
-            if a["quality"] == "high" or fisheye_cam:
-                # DSP-SIFT + affine-shape: COLMAP's documented recipe for more matches on hard data.
-                # The affine-shape estimate adapts each feature to the LOCAL warp, which is the only
-                # way plain SIFT can match across a fisheye's distortion - the difference between a
-                # usable model and noise on a 155-deg lens. FORCED for fisheye even on 'fast'. COLMAP
-                # can't GPU these, so it's CPU-only (slow on many photos - thin the frames if needed).
-                feat += ["--SiftExtraction.estimate_affine_shape", "1",
-                         "--SiftExtraction.domain_size_pooling", "1",
-                         f"--{ext_gpu}", "0"]
-                why = ("fisheye lens -> forcing DSP-SIFT + affine-shape (plain SIFT can't match a "
-                       "fisheye)" if fisheye_cam and a["quality"] != "high"
-                       else "feature quality HIGH: DSP-SIFT + affine-shape")
-                self.q.put(("log", f"[{why}; CPU-only, slower on many photos]\n"))
-            else:
-                feat += [f"--{ext_gpu}", "1"]
-            if not run(feat, "feature_extractor"):
-                return self.q.put(("done", 1))
-
-            fm = _colmap_help(a["colmap"], "sequential_matcher")
-            mat_gpu = _resolve(fm, "FeatureMatching.use_gpu", "SiftMatching.use_gpu")
-            overlap_opt = _resolve(fm, "SequentialMatching.overlap", "SequentialPairing.overlap")
-            quad_opt = _present(fm, "SequentialMatching.quadratic_overlap",
-                                "SequentialPairing.quadratic_overlap")
-            loop_opt = _present(fm, "SequentialMatching.loop_detection",
-                                "SequentialPairing.loop_detection")
-            vocab_opt = _present(fm, "SequentialMatching.vocab_tree_path",
-                                 "SequentialPairing.vocab_tree_path")
-            guided_opt = _present(fm, "FeatureMatching.guided_matching", "SiftMatching.guided_matching")
-            # loop closure needs a real vocab-tree file and a supported option
-            use_vocab = bool(a["vocab"]) and os.path.isfile(a["vocab"]) and bool(vocab_opt)
-            match = [a["colmap"], "sequential_matcher", "--database_path", a["db"],
-                     f"--{overlap_opt}", a["overlap"], f"--{mat_gpu}", "1"]
-            if quad_opt:
-                match += [f"--{quad_opt}", "1"]
-            if loop_opt:
-                match += [f"--{loop_opt}", "1" if use_vocab else "0"]
-            if use_vocab:
-                match += [f"--{vocab_opt}", a["vocab"]]
-            if fisheye_cam and guided_opt:
-                # guided matching re-matches using the estimated two-view geometry - recovers more
-                # inliers across the heavy distortion of a wide/fisheye lens.
-                match += [f"--{guided_opt}", "1"]
-                self.q.put(("log", "[fisheye: guided_matching on - more inliers across distortion]\n"))
-            if not run(match, "sequential_matcher"):
-                return self.q.put(("done", 1))
-
-            # Estimate focal priors from the view graph. Video frames usually have no EXIF
-            # focal, so COLMAP's default guess is off and global_mapper rejects many pairs with
-            # "relative relation errors". view_graph_calibrator fixes the focals first (the
-            # GLOMAP default). Non-fatal: older COLMAP may lack it.
-            if not run([a["colmap"], "view_graph_calibrator", "--database_path", a["db"]],
-                       "view_graph_calibrator (focal priors)"):
-                if self._cancel.is_set():
-                    return self.q.put(("done", 1))
-                self.q.put(("log", "view_graph_calibrator unavailable/failed - continuing; if "
-                                   "global_mapper rejects many pairs, focal priors are the cause.\n"))
-
-            os.makedirs(a["sparse"], exist_ok=True)
-            if a.get("mapper", "").startswith("Incremental"):
-                # Incremental SfM: registers cameras one at a time with geometric verification, so it
-                # rejects the wrong repeated-structure matches a global solve folds into noise.
-                mapper = [a["colmap"], "mapper", "--database_path", a["db"],
-                          "--image_path", a["images"], "--output_path", a["sparse"]]
-                label = "mapper (incremental, robust)"
-            else:
-                mapper = [a["colmap"], "global_mapper", "--database_path", a["db"],
-                          "--image_path", a["images"], "--output_path", a["sparse"]]
-                label = "global_mapper (GLOMAP)"
-            if not run(mapper, label):
-                return self.q.put(("done", 1))
-
-            self.q.put(("log", f"\nSfM complete -> {os.path.join(a['sparse'], '0')}\n"))
-            self.q.put(("done", 0))
-        except FileNotFoundError:
-            exe = a.get("colmap") or a.get("gluemap") or "the SfM tool"
-            self.q.put(("log", f"\nERROR: could not launch '{exe}'.\n"))
-            self.q.put(("done", 1))
-        except Exception:
-            self.q.put(("log", "\n" + traceback.format_exc()))
-            self.q.put(("done", 1))
 
     # ── Step 2: refine ──────────────────────────────────────────────────────────
     def _refine_kwargs(self):
@@ -1241,22 +597,6 @@ class App:
         )
         return kw, (self._abs(photos) if photos else None)
 
-    def run_all(self):
-        """Build the model, then automatically align to the cloud - one unattended run."""
-        if self._worker and self._worker.is_alive():
-            return messagebox.showwarning("Busy", "A job is already running.")
-        try:
-            kw, images_dir = self._refine_kwargs()       # validate align inputs up front
-        except (ValueError, tk.TclError) as e:
-            return messagebox.showerror("Invalid input", str(e))
-        if not os.path.isfile(kw["lidar"]):
-            return messagebox.showerror("Not found", f"LiDAR file not found:\n{kw['lidar']}")
-        # arm the chain, then run Build; _on_done starts Align automatically if Build succeeds
-        self._chain = (kw, images_dir, self._paths()["project"])
-        self.sfm_run()
-        if not (self._worker and self._worker.is_alive()):
-            self._chain = None       # Build didn't start (bad input) -> don't chain
-
     def refine_run(self):
         if self._worker and self._worker.is_alive():
             return messagebox.showwarning("Busy", "A job is already running.")
@@ -1267,8 +607,8 @@ class App:
         if not os.path.isdir(kw["sparse_in"]):
             return messagebox.showerror(
                 "Not found",
-                f"No camera model at:\n{kw['sparse_in']}\n\nRun Step 1 first, or set "
-                f"'Existing model' in Advanced.")
+                f"No camera model at:\n{kw['sparse_in']}\n\nSet 'Existing model' (Advanced) to a "
+                f"COLMAP export, or use 'Pull from RealityScan'.")
         if not os.path.isfile(kw["lidar"]):
             return messagebox.showerror("Not found", f"LiDAR file not found:\n{kw['lidar']}")
         self._start("running alignment (Stop cancels after the current round)…",
@@ -1342,7 +682,7 @@ class App:
             return messagebox.showerror("Not found", f"Cloud file not found:\n{scan}")
         sparse_in = self._paths()["sparse_in"]
         if not self._has_model(sparse_in):
-            return messagebox.showerror("No model", "Build or set the model first (Step 1).")
+            return messagebox.showerror("No model", "Set 'Existing model' (Advanced) first.")
         self._start("opening the visual align window (exporting model, loading scan)…",
                     self._align_visual_worker, (sparse_in, scan, self._paths()["sparse_out"]))
 
@@ -1389,13 +729,13 @@ class App:
             self.q.put(("log", "\n" + traceback.format_exc()))
             self.q.put(("done", 1))
 
-    # ── Preview the SfM model in 3D (is it recognizable, or noise?) ───────────────
+    # ── Preview the model in 3D (is it recognizable, or noise?) ───────────────────
     def preview_model_run(self):
         if self._worker and self._worker.is_alive():
             return messagebox.showwarning("Busy", "A job is already running.")
         sparse_in = self._paths()["sparse_in"]
         if not self._has_model(sparse_in):
-            return messagebox.showerror("No model", "Build or set the model first (Step 1).")
+            return messagebox.showerror("No model", "Set 'Existing model' (Advanced) first.")
         self._start("opening the model in 3D…", self._preview_model_worker,
                     (sparse_in, self._paths()["sparse_out"]))
 
@@ -1703,7 +1043,7 @@ class App:
     # ── job lifecycle ────────────────────────────────────────────────────────────
     def _toggle_actions(self, state):
         """Enable/disable every action button at once (the run lifecycle blocks them all)."""
-        for b in (self.all_btn, self.sfm_btn, self.refine_btn, self.dedup_btn, self.xmp_btn,
+        for b in (self.refine_btn, self.dedup_btn, self.xmp_btn,
                   self.multi_btn, self.rs_pull_btn, self.rs_send_btn):
             b.config(state=state)
 
@@ -1720,11 +1060,11 @@ class App:
     def stop(self):
         if self._worker and self._worker.is_alive():
             self._cancel.set()
-            _kill_tree(self._proc)   # SfM runs as a subprocess: kill it now (don't wait on a blocked read)
+            _kill_tree(self._proc)   # a viewer / RealityScan subprocess: kill it now (don't wait on a read)
             # The align/merge run in-process and can't be hard-killed mid-solve; they stop at the
             # next safe point (between scans while loading, between rounds while solving). The
             # throbber keeps spinning and the status reads "stopping" so it doesn't look frozen.
-            self._append("\n[stopping — SfM stops now; align/merge finish the current step first]\n")
+            self._append("\n[stopping — a subprocess stops now; align/merge finish the current step first]\n")
             self.stop_btn.config(state="disabled")
 
     def _drain(self):
@@ -1745,13 +1085,6 @@ class App:
                     self.var["model_override"].set(payload)
                     self._append(f"\n'Existing model' set to the RealityScan export:\n{payload}\n"
                                  f"Next: click 'Align components'.\n")
-                elif kind == "colmap_installed":
-                    self._colmap_exe = payload
-                    self._update_colmap_banner()
-                    self._colmap_dl_btn.config(state="normal", text="⬇ Download COLMAP")
-                    self._toggle_actions("normal")
-                    self._append("\nCOLMAP ready.\n")
-                    self._worker = None
                 else:
                     self._on_done(payload)
         except queue.Empty:
@@ -1761,39 +1094,19 @@ class App:
         self.root.after(100, self._drain)
 
     def _on_done(self, code):
-        # Build + Align chain: after Build succeeds, auto-start Align (unattended full run).
-        if code == 0 and self._chain is not None:
-            kw, images_dir, project = self._chain
-            self._chain = None
-            model = self._find_model_dir(project)
-            if self._has_model(model):
-                kw["sparse_in"] = model
-                self._append("\n=== Build done — starting Align to cloud ===\n")
-                self._cancel.clear()
-                self._toggle_actions("disabled")
-                self.stop_btn.config(state="normal")
-                self.status_text.config(text="running…")
-                self._worker = threading.Thread(target=self._refine_worker,
-                                                args=(kw, images_dir), daemon=True)
-                self._worker.start()
-                return
-            self._append("\nBuild finished but no camera model was found - skipping align.\n")
-        self._chain = None
         tag = "cancelled" if self._cancel.is_set() else ("done" if code == 0 else f"error ({code})")
         self._append(f"\n─── finished ({tag}) ───\n")
         self.status_text.config(text=tag)
         self.status_throb.config(text="")
         self._toggle_actions("normal")
         self.stop_btn.config(state="disabled")
-        self._colmap_dl_btn.config(state="normal", text="⬇ Download COLMAP")
-        self._gluemap_btn.config(state="normal", text="⬇ Install GLUEMAP (WSL)")
         self._worker = None
 
     def _append(self, text):
         self.log.configure(state="normal")
         self.log.insert("end", text)
         # Keep only the last _LOG_MAX_LINES so insert/scroll stay cheap no matter how long the
-        # run logs for. The full COLMAP output still streams; only the on-screen tail is bounded.
+        # run logs for. The full run output still streams; only the on-screen tail is bounded.
         end_line = int(self.log.index("end-1c").split(".")[0])
         if end_line > _LOG_MAX_LINES:
             self.log.delete("1.0", f"{end_line - _LOG_MAX_LINES + 1}.0")
@@ -1807,7 +1120,7 @@ class App:
 
     def on_close(self):
         self._cancel.set()
-        _kill_tree(self._proc)   # don't leave colmap.exe orphaned when the window closes
+        _kill_tree(self._proc)   # don't leave a viewer / RealityScan subprocess orphaned on close
         self._save_settings()
         self.root.destroy()
 

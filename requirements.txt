@@ -1,5 +1,4 @@
 # Python deps for the LiDAR-constrained refinement.
-# COLMAP + GLOMAP themselves are separate native installs (see scripts/run_sfm.*).
 # Verified working set: pycolmap 4.0.4 / pyceres 2.6 (see refine.py header).
 
 pycolmap>=4.0      # read/write COLMAP model + CeresBundleAdjuster (reprojection + manifolds)
@@ -10,4 +9,3 @@ open3d>=0.17       # point-cloud load, voxel downsample, scaled ICP
 laspy[lazrs]>=2.5  # streaming chunked LAS/LAZ read for out-of-core crop of the fat cloud
 pye57>=0.4         # read .e57 scans (lazy-imported in lidar_index + scripts/e57_to_laz.py)
 pyyaml>=6.0
-certifi>=2024.0    # CA bundle for verified-TLS COLMAP download in the GUI (ui/refine_gui.py)

@@ -13,11 +13,10 @@ Target accuracy: centimetre-level point-to-plane fit to the scan over the whole 
 
 **In:** the RealityScan round-trip (drive its CLI to pull the alignment in as COLMAP and push
 corrected poses back), aligning all RealityScan components in one run, pre-alignment, LiDAR
-point-to-plane refinement, QA, RealityScan XMP export, and SfM orchestration
-(COLMAP/GLOMAP/hloc/GLUEMAP) for when you don't use RealityScan to match.
+point-to-plane refinement, QA, and RealityScan XMP export.
 
-**Out:** meshing, texturing, dense MVS — those stay in RealityScan/COLMAP. lidar-align only
-fixes pose/scale/drift.
+**Out:** matching/SfM (RealityScan does it, or bring a COLMAP model from elsewhere), meshing,
+texturing, dense MVS. lidar-align only fixes pose/scale/drift.
 
 ## Target environment
 
@@ -25,14 +24,14 @@ fixes pose/scale/drift.
   sized for this (e.g. `ba_max_points=800k`, all-core solve). Lower them on a weak machine.
 - **Subjects:** architectural / survey scenes — often repetitive (stairs, railings, façades),
   sometimes shot on wide/fisheye action cams, against dense terrestrial scans (Leica etc.).
-- **SfM engines:** COLMAP (SIFT, incremental or GLOMAP global), hloc (SuperPoint+LightGlue,
-  native Windows GPU), GLUEMAP (learned, Linux/CUDA via WSL).
+- **Matcher:** RealityScan (handles fisheye + repetition natively, exports COLMAP). Any other
+  COLMAP sparse model works too, but lidar-align no longer builds one itself.
 
 ## Pipeline
 
-1. **Match** — photos → a COLMAP sparse model. Normally RealityScan (it handles fisheye and
-   repeated structure natively, then exports to COLMAP); otherwise COLMAP/GLOMAP/hloc/GLUEMAP
-   here. This is the hard part for repetitive/fisheye scenes.
+1. **Match** — photos → a COLMAP sparse model. RealityScan (it handles fisheye and repeated
+   structure natively, then exports to COLMAP), or any COLMAP model brought from elsewhere. This
+   is the hard part for repetitive/fisheye scenes, and lidar-align leaves it to RealityScan.
 2. **Pre-align** — coarse Sim3 onto the scan. RealityScan components georeferenced to the imported
    scan are already there; otherwise the visual slider tool / manual correspondences (reliable),
    or auto FPFH (fails on repetitive structure + partial overlap).
@@ -61,10 +60,6 @@ fixes pose/scale/drift.
 - **Manual visual alignment is the reliable pre-align.** Auto-scale can't resolve repetitive
   structure + partial overlap (it locks a different wrong scale each run). The slider tool /
   correspondences file pin scale+pose by hand; the refine only polishes from there.
-- **Mapper defaults to Incremental.** GLOMAP global silently folds repetitive/fisheye scenes
-  into noise; for this tool's subjects, robust beats fast.
-- **Fisheye is modelled, not dewarped.** Use `OPENCV_FISHEYE` + a matcher that survives the
-  distortion (DSP-SIFT/affine-shape for COLMAP, learned features for hloc/GLUEMAP).
 
 ## Status & known gaps
 
@@ -73,9 +68,9 @@ fixes pose/scale/drift.
   takes a settings `.xml` saved from the GUI — there is no CLI format flag), that it accepts the
   export directory, and that `-addFolder` re-imports the sidecar `.xmp` as locked poses (else fall
   back to `addImageWithCalibration` per image).
-- **Without RealityScan, the gate is SfM quality.** A broken sparse cloud (repetitive/fisheye
-  matching failure) can't be aligned — hence the **Preview model** button to catch it early; hloc
-  is the best local bet for wide/fisheye.
+- **The gate is matching quality.** A broken sparse cloud (repetitive/fisheye matching failure)
+  can't be aligned — hence the **Preview model** button to catch it early before refining. Getting
+  a clean model is RealityScan's job.
 - **COLMAP→RealityScan axis convention** (Y/Z flip) is the usual one but unverified; A/B the
   `xmp_axis_flip` presets if cameras import mirrored.
 - **Rolling shutter** isn't modelled; cull blurry frames.
