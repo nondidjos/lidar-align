@@ -666,14 +666,14 @@ class App:
                        tip="Optional COLMAP vocabulary-tree .bin file that lets it recognise when "
                            "the camera revisits the same place (loop closure). (COLMAP/GLOMAP only)")
         self._combo(sf, 7, "Mapper (COLMAP)", "sfm_mapper",
-                    ["GLOMAP global (fast)", "Incremental (robust)"], "GLOMAP global (fast)",
-                    tip="How COLMAP turns matches into a model. GLOMAP global: fast, but on REPEATED "
-                        "structure (stairs, railings, balusters) or wide/fisheye lenses it can match "
-                        "the wrong repeats and fold the whole reconstruction into noise (the 'matrix "
-                        "not positive definite' warnings). Incremental: adds cameras one at a time "
-                        "with geometric verification - far more robust to repetition and fisheye, but "
-                        "slower. If your sparse cloud came out as unrecognizable noise, switch to "
-                        "Incremental and rebuild. (COLMAP/GLOMAP only)")
+                    ["Incremental (robust)", "GLOMAP global (fast)"], "Incremental (robust)",
+                    tip="How COLMAP turns matches into a model. Incremental (default): adds cameras "
+                        "one at a time with geometric verification - robust to REPEATED structure "
+                        "(stairs, railings, balusters) and wide/fisheye lenses, the usual subjects "
+                        "here; slower but reliable. GLOMAP global: faster, but on repeated or fisheye "
+                        "scenes it matches the wrong repeats and folds the reconstruction into noise "
+                        "(the 'matrix not positive definite' warnings) - only pick it for easy, "
+                        "well-textured, non-repetitive sets. (COLMAP/GLOMAP only)")
         self._path_row(sf, 8, "hloc Python (torch env)", "sfm_hloc_python", "", "file",
                        [("python.exe", "python.exe"), ("All", "*.*")],
                        tip="Only for SfM Engine = hloc. The python.exe of a venv that has torch + "
