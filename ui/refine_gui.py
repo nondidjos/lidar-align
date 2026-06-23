@@ -481,6 +481,12 @@ class App:
              "Use this to try a different Axis convention in seconds when the cameras import "
              "mirrored or upside-down: change 'Axis convention' under Advanced, click this, re-import "
              "one image in RealityScan, repeat until it looks right.")
+        self.preview_btn = ttk.Button(bar, text="Preview model", command=self.preview_model_run)
+        self.preview_btn.pack(side="left", padx=(6, 0))
+        _Tip(self.preview_btn,
+             "Open the built SfM model in 3D to check it's RECOGNIZABLE before aligning. If it's "
+             "noise (no recognizable structure), step 1 failed - no alignment can fix that, so fix "
+             "the SfM first (switch Mapper to Incremental, or SfM Engine to hloc for wide/fisheye).")
         self.align_vis_btn = ttk.Button(bar, text="Align visually", command=self.align_visual_run)
         self.align_vis_btn.pack(side="left", padx=(6, 0))
         _Tip(self.align_vis_btn,
@@ -1333,6 +1339,39 @@ class App:
             self.q.put(("log", "\n" + traceback.format_exc()))
             self.q.put(("done", 1))
 
+    # ── Preview the SfM model in 3D (is it recognizable, or noise?) ───────────────
+    def preview_model_run(self):
+        if self._worker and self._worker.is_alive():
+            return messagebox.showwarning("Busy", "A job is already running.")
+        sparse_in = self._paths()["sparse_in"]
+        if not self._has_model(sparse_in):
+            return messagebox.showerror("No model", "Build or set the model first (Step 1).")
+        self._start("opening the model in 3D…", self._preview_model_worker,
+                    (sparse_in, self._paths()["sparse_out"]))
+
+    def _preview_model_worker(self, sparse_in, sparse_out):
+        try:
+            import subprocess
+            from lidar_align import colmap_io
+            from lidar_align.refine import _clean_model, _export_picking_ply
+            with contextlib.redirect_stdout(_QueueWriter(self.q)):
+                os.makedirs(sparse_out, exist_ok=True)
+                ply = os.path.join(sparse_out, "model_for_picking.ply")
+                rec = colmap_io.load(sparse_in)
+                _clean_model(rec)
+                _export_picking_ply(rec, ply)
+                cmd = ([sys.executable, "--view-model", ply] if getattr(sys, "frozen", False)
+                       else [sys.executable, os.path.abspath(__file__), "--view-model", ply])
+                print("opening the model in 3D — is the structure recognizable, or is it noise?")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1)
+            for line in proc.stdout:
+                self.q.put(("log", line))
+            self.q.put(("done", proc.wait()))
+        except Exception:
+            self.q.put(("log", "\n" + traceback.format_exc()))
+            self.q.put(("done", 1))
+
     # ── Re-export XMP poses from the already-aligned model (no re-align) ──────────
     def reexport_xmp_run(self):
         if self._worker and self._worker.is_alive():
@@ -1604,7 +1643,7 @@ def _selftest():
 def main():
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
-    if "--align-tool" in sys.argv:                     # interactive scale/pose matcher subprocess
+    if "--align-tool" in sys.argv or "--view-model" in sys.argv:   # 3D viewer subprocesses
         from lidar_align.align_tool import cli_main
         sys.exit(cli_main(sys.argv))
     root = tk.Tk()

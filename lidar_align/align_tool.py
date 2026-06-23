@@ -251,7 +251,32 @@ def manual_align(scan_pts, model_pts, out_json):
         return manual_align_keys(scan, model0, out_json)
 
 
+def view_cloud(ply_path):
+    """Just show a point cloud (Open3D's simplest, most robust viewer) so you can eyeball whether the
+    SfM came out recognizable BEFORE sinking hours into aligning it. Returns 0 on success."""
+    import open3d as o3d
+    pc = o3d.io.read_point_cloud(str(ply_path))
+    n = len(pc.points)
+    if n == 0:
+        _log(f"empty / unreadable cloud: {ply_path}")
+        return 1
+    _log(f"previewing {n:,} points - is the structure recognizable, or is it noise? "
+         f"close the window when done.")
+    o3d.visualization.draw_geometries(
+        [pc], window_name="SfM model preview - recognizable structure, or noise?",
+        width=1360, height=860)
+    return 0
+
+
 def cli_main(argv):
+    if "--view-model" in argv:
+        i = argv.index("--view-model")
+        try:
+            return view_cloud(argv[i + 1])
+        except Exception:
+            import traceback
+            _log("ERROR:\n" + traceback.format_exc())
+            return 1
     try:
         i = argv.index("--align-tool")
         scan_path, model_ply, out_json = argv[i + 1], argv[i + 2], argv[i + 3]
