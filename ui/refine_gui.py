@@ -696,6 +696,42 @@ class App:
                        tip="Optional YAML configuration file for GLUEMAP (e.g. configs/example.yaml). "
                            "If blank, GLUEMAP uses its default settings.")
 
+        # RealityScan round-trip: drive RealityScan's CLI to pull the alignment in (as COLMAP) and
+        # push the corrected poses back out (as XMP), so you never touch its export/import menus.
+        rs = ttk.Labelframe(parent, text="RealityScan round-trip", padding=8)
+        rs.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=4)
+        self._path_row(rs, 0, "RealityScan.exe", "rs_exe", "", "file",
+                       [("RealityScan", "RealityScan.exe RealityCapture.exe"), ("All", "*.*")],
+                       tip="Path to RealityScan.exe (or RealityCapture.exe). Used to export your "
+                           "aligned components and to push the corrected poses back - no menus.")
+        self._path_row(rs, 1, "Project (.rsproj)", "rs_proj", "", "file",
+                       [("RealityScan project", "*.rsproj *.rcproj"), ("All", "*.*")],
+                       tip="The RealityScan project that already has your photos aligned against the "
+                           "imported LiDAR. 'Pull' exports its registration to COLMAP.")
+        self._path_row(rs, 2, "COLMAP export preset (.xml)", "rs_export_preset", "", "file",
+                       [("Export settings", "*.xml"), ("All", "*.*")],
+                       tip="A registration-export settings file saved once from RealityScan's Export "
+                           "Registration dialog with the COLMAP format chosen (Export Registration -> "
+                           "pick COLMAP -> Save Settings to .xml). RealityScan's CLI has no preset "
+                           "name, so it needs this file. Blank = use RealityScan's current export "
+                           "settings (only gives COLMAP if they're already set to it).")
+        self._check(rs, 3, "Build the mesh after sending poses back", "rs_mesh", False,
+                    tip="After re-importing the corrected poses, also run a normal-quality mesh and "
+                        "save. Off = just import the poses and save; you mesh in RealityScan.")
+        rbar = ttk.Frame(rs)
+        rbar.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.rs_pull_btn = ttk.Button(rbar, text="⬇ Pull from RealityScan", command=self.rs_pull_run)
+        self.rs_pull_btn.pack(side="left")
+        _Tip(self.rs_pull_btn,
+             "Run RealityScan headless to export its alignment to COLMAP, then point 'Existing "
+             "model' at it for you. Next step: click 'Align components'.")
+        self.rs_send_btn = ttk.Button(rbar, text="⬆ Send to RealityScan", command=self.rs_send_run)
+        self.rs_send_btn.pack(side="left", padx=(6, 0))
+        _Tip(self.rs_send_btn,
+             "After 'Align components' has written the corrected .xmp next to your photos, this "
+             "builds a fresh RealityScan project from those photos with the corrected poses baked "
+             "in (RealityScan reads the .xmp sitting next to each image). Optionally meshes it.")
+
     def _preset_row(self, parent, row):
         self._label_with_tip(
             parent, row, "Speed / quality preset",
@@ -1484,6 +1520,107 @@ class App:
             self.q.put(("log", "\n" + traceback.format_exc()))
             self.q.put(("done", 1))
 
+    # ── RealityScan round-trip: drive its CLI to pull components in / push poses back ─────
+    def _run_rs(self, cmd):
+        """Run a RealityScan CLI command, streaming its output and honouring Stop. Returns the exit
+        code (or -1 if it couldn't even launch)."""
+        self.q.put(("log", "  " + " ".join((f'"{c}"' if " " in c else c) for c in cmd) + "\n\n"))
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1)
+        except OSError as e:
+            self.q.put(("log", f"could not launch RealityScan: {e}\n"))
+            return -1
+        self._proc = proc
+        for line in proc.stdout:
+            self.q.put(("log", line))
+            if self._cancel.is_set():
+                _kill_tree(proc); break
+        proc.wait(); self._proc = None
+        return proc.returncode
+
+    def rs_pull_run(self):
+        if self._worker and self._worker.is_alive():
+            return messagebox.showwarning("Busy", "A job is already running.")
+        exe = self.var["rs_exe"].get().strip()
+        proj = self.var["rs_proj"].get().strip()
+        if not (exe and os.path.isfile(self._abs(exe))):
+            return messagebox.showerror("RealityScan not set",
+                                        "Set the path to RealityScan.exe (Advanced).")
+        if not (proj and os.path.isfile(self._abs(proj))):
+            return messagebox.showerror("No project", "Set your RealityScan .rsproj (Advanced).")
+        preset = self.var["rs_export_preset"].get().strip()
+        out_dir = os.path.join(self._paths()["project"], "rs_export")
+        self._start("exporting the RealityScan alignment to COLMAP…", self._rs_pull_worker,
+                    (self._abs(exe), self._abs(proj), out_dir,
+                     self._abs(preset) if preset else None))
+
+    def _rs_pull_worker(self, exe, proj, out_dir, preset):
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            cmd = ([exe, "-headless", "-load", proj, "-exportRegistration", out_dir]
+                   + ([preset] if preset else []) + ["-quit"])
+            rc = self._run_rs(cmd)
+            if rc != 0:
+                self.q.put(("log", f"\nRealityScan exited {rc}. Check the .exe path, the project, and "
+                                   f"that the COLMAP export preset is valid.\n"))
+                self.q.put(("done", 1)); return
+            from lidar_align.refine import discover_components
+            comps = discover_components(out_dir)
+            if not comps:
+                self.q.put(("log", f"\nRealityScan finished but no COLMAP model landed under "
+                                   f"{out_dir}.\nYour export preset is probably not set to the COLMAP "
+                                   f"format - re-save it from the Export Registration dialog.\n"))
+                self.q.put(("done", 1)); return
+            self.q.put(("log", f"\nexported {len(comps)} component(s):\n"
+                               + "".join(f"  {c}\n" for c in comps)))
+            self.q.put(("rs_pulled", out_dir))
+            self.q.put(("done", 0))
+        except Exception:
+            self.q.put(("log", "\n" + traceback.format_exc()))
+            self.q.put(("done", 1))
+
+    def rs_send_run(self):
+        if self._worker and self._worker.is_alive():
+            return messagebox.showwarning("Busy", "A job is already running.")
+        exe = self.var["rs_exe"].get().strip()
+        photos = self.var["photos"].get().strip()
+        if not (exe and os.path.isfile(self._abs(exe))):
+            return messagebox.showerror("RealityScan not set",
+                                        "Set the path to RealityScan.exe (Advanced).")
+        if not (photos and os.path.isdir(self._abs(photos))):
+            return messagebox.showerror("No photos", "Set the Photos folder - the corrected .xmp sit "
+                                        "next to those images.")
+        ph = self._abs(photos)
+        import glob as _glob
+        if not _glob.glob(os.path.join(ph, "*.xmp")):
+            return messagebox.showerror("No XMP yet", "No .xmp found next to the photos. Run 'Align "
+                                        "components' with 'Write XMP next to photos' on first.")
+        save_to = os.path.join(self._paths()["project"], "rs_corrected.rsproj")
+        self._start("sending the corrected poses back into RealityScan…", self._rs_send_worker,
+                    (self._abs(exe), ph, save_to, bool(self.var["rs_mesh"].get())))
+
+    def _rs_send_worker(self, exe, photos, save_to, mesh):
+        try:
+            # RealityScan reads an .xmp sitting next to each image as that camera's calibration, so
+            # adding the folder pulls in the corrected (locked) poses; -align rebuilds the component
+            # from those priors. A fresh project is built so the original alignment is left intact.
+            cmd = [exe, "-headless", "-addFolder", photos, "-align"]
+            if mesh:
+                cmd += ["-calculateNormalModel"]
+            cmd += ["-save", save_to, "-quit"]
+            rc = self._run_rs(cmd)
+            if rc == 0:
+                self.q.put(("log", f"\ndone. corrected project -> {save_to}\n"
+                                   f"Open it in RealityScan; the cameras sit on the LiDAR.\n"))
+            else:
+                self.q.put(("log", f"\nRealityScan exited {rc}. Check the .exe path and that the "
+                                   f".xmp are next to the photos.\n"))
+            self.q.put(("done", 0 if rc == 0 else 1))
+        except Exception:
+            self.q.put(("log", "\n" + traceback.format_exc()))
+            self.q.put(("done", 1))
+
     # ── Re-export XMP poses from the already-aligned model (no re-align) ──────────
     def reexport_xmp_run(self):
         if self._worker and self._worker.is_alive():
@@ -1549,15 +1686,17 @@ class App:
         self.root.after(100, self._throb_tick)
 
     # ── job lifecycle ────────────────────────────────────────────────────────────
+    def _toggle_actions(self, state):
+        """Enable/disable every action button at once (the run lifecycle blocks them all)."""
+        for b in (self.all_btn, self.sfm_btn, self.refine_btn, self.dedup_btn, self.xmp_btn,
+                  self.multi_btn, self.rs_pull_btn, self.rs_send_btn):
+            b.config(state=state)
+
     def _start(self, msg, target, args):
         self._cancel.clear()
         self._clear_log()
         self._append(msg + "\n\n")
-        self.all_btn.config(state="disabled")
-        self.sfm_btn.config(state="disabled")
-        self.refine_btn.config(state="disabled")
-        self.dedup_btn.config(state="disabled")
-        self.xmp_btn.config(state="disabled")
+        self._toggle_actions("disabled")
         self.stop_btn.config(state="normal")
         self.status_text.config(text="running…")
         self._worker = threading.Thread(target=target, args=args, daemon=True)
@@ -1587,15 +1726,15 @@ class App:
                 if kind == "dedup_done":
                     self.var["lidar"].set(payload)         # repoint the align at the merged copy
                     self._append(f"\nReference cloud set to merged copy:\n{payload}\n")
+                elif kind == "rs_pulled":
+                    self.var["model_override"].set(payload)
+                    self._append(f"\n'Existing model' set to the RealityScan export:\n{payload}\n"
+                                 f"Next: click 'Align components'.\n")
                 elif kind == "colmap_installed":
                     self._colmap_exe = payload
                     self._update_colmap_banner()
                     self._colmap_dl_btn.config(state="normal", text="⬇ Download COLMAP")
-                    self.all_btn.config(state="normal")
-                    self.sfm_btn.config(state="normal")
-                    self.refine_btn.config(state="normal")
-                    self.dedup_btn.config(state="normal")
-                    self.xmp_btn.config(state="normal")
+                    self._toggle_actions("normal")
                     self._append("\nCOLMAP ready.\n")
                     self._worker = None
                 else:
@@ -1616,11 +1755,7 @@ class App:
                 kw["sparse_in"] = model
                 self._append("\n=== Build done — starting Align to cloud ===\n")
                 self._cancel.clear()
-                self.all_btn.config(state="disabled")
-                self.sfm_btn.config(state="disabled")
-                self.refine_btn.config(state="disabled")
-                self.dedup_btn.config(state="disabled")
-                self.xmp_btn.config(state="disabled")
+                self._toggle_actions("disabled")
                 self.stop_btn.config(state="normal")
                 self.status_text.config(text="running…")
                 self._worker = threading.Thread(target=self._refine_worker,
@@ -1633,11 +1768,7 @@ class App:
         self._append(f"\n─── finished ({tag}) ───\n")
         self.status_text.config(text=tag)
         self.status_throb.config(text="")
-        self.all_btn.config(state="normal")
-        self.sfm_btn.config(state="normal")
-        self.refine_btn.config(state="normal")
-        self.dedup_btn.config(state="normal")
-        self.xmp_btn.config(state="normal")
+        self._toggle_actions("normal")
         self.stop_btn.config(state="disabled")
         self._colmap_dl_btn.config(state="normal", text="⬇ Download COLMAP")
         self._gluemap_btn.config(state="normal", text="⬇ Install GLUEMAP (WSL)")
