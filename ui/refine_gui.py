@@ -474,6 +474,13 @@ class App:
         self.sfm_btn.pack(side="left", padx=(6, 0))
         self.refine_btn = ttk.Button(bar, text="2. Align to cloud", command=self.refine_run)
         self.refine_btn.pack(side="left", padx=(6, 0))
+        self.multi_btn = ttk.Button(bar, text="Align components", command=self.align_components_run)
+        self.multi_btn.pack(side="left", padx=(6, 0))
+        _Tip(self.multi_btn,
+             "For a RealityScan export split into several components. Point 'Existing model' at the "
+             "parent folder; this aligns ALL of them onto the LiDAR in one run. Components RS already "
+             "placed on the scan are refined automatically; unbound ones pop a placement window "
+             "(scale/rotate/move) for you. Every component's .xmp lands in the scan's frame.")
         self.xmp_btn = ttk.Button(bar, text="↻ Re-export XMP", command=self.reexport_xmp_run)
         self.xmp_btn.pack(side="left", padx=(6, 0))
         _Tip(self.xmp_btn,
@@ -1379,6 +1386,83 @@ class App:
             proc.wait()
             self._proc = None
             self.q.put(("done", proc.returncode))
+        except Exception:
+            self.q.put(("log", "\n" + traceback.format_exc()))
+            self.q.put(("done", 1))
+
+    # ── Align ALL RealityScan components in one run ──────────────────────────────
+    def align_components_run(self):
+        if self._worker and self._worker.is_alive():
+            return messagebox.showwarning("Busy", "A job is already running.")
+        if not self.var["lidar"].get().strip():
+            return messagebox.showerror("Invalid input", "Set the Reference cloud first.")
+        override = self.var["model_override"].get().strip()
+        parent = self._abs(override) if override else self._paths()["sparse"]
+        from lidar_align.refine import discover_components
+        comps = discover_components(parent)
+        if not comps:
+            return messagebox.showerror(
+                "No components", f"No COLMAP models found under:\n{parent}\n\nPoint 'Existing model' "
+                f"at the RealityScan export's parent folder (the one holding the component subfolders).")
+        try:
+            kw, _photos = self._refine_kwargs()
+        except ValueError as e:
+            return messagebox.showerror("Invalid input", str(e))
+        self._start(f"aligning {len(comps)} component(s) onto the LiDAR…",
+                    self._multi_align_worker, (comps, kw))
+
+    def _multi_align_worker(self, comps, kw):
+        try:
+            import subprocess
+            from lidar_align import colmap_io
+            from lidar_align.refine import (refine, component_placed, _clean_model,
+                                            _export_picking_ply)
+            from lidar_align.lidar_index import _load_points
+            lidar, xmp_out, out_base = kw["lidar"], kw["xmp_out"], kw["sparse_out"]
+            with contextlib.redirect_stdout(_QueueWriter(self.q)):
+                print(f"found {len(comps)} component(s); peeking scan extent…")
+                peek = _load_points(lidar, voxel=1.0, max_points=200_000, log=print)
+                lo, hi = peek.min(0), peek.max(0)
+                del peek
+            done = 0
+            for i, comp in enumerate(comps):
+                if self._cancel.is_set():
+                    self.q.put(("log", "\n[stopped]\n")); break
+                placed = component_placed(colmap_io.load(comp), lo, hi)
+                out_i = os.path.join(out_base, f"comp{i}")
+                ckw = dict(kw, sparse_in=comp, sparse_out=out_i, xmp_out=xmp_out,
+                           correspondences=None, manual_align=None, prealign=False)
+                if placed:
+                    self.q.put(("log", f"\n=== component {i+1}/{len(comps)}: in scan coords -> "
+                                       f"refining ===\n"))
+                    refine(**ckw); done += 1
+                    continue
+                # unbound -> pop the placement window, then refine with the manual Sim3
+                self.q.put(("log", f"\n=== component {i+1}/{len(comps)}: UNBOUND -> opening the "
+                                   f"placement window; place it on the scan, ENTER to accept ===\n"))
+                os.makedirs(out_i, exist_ok=True)
+                with contextlib.redirect_stdout(_QueueWriter(self.q)):
+                    rc = colmap_io.load(comp); _clean_model(rc)
+                    ply = os.path.join(out_i, "model_for_picking.ply"); _export_picking_ply(rc, ply)
+                mj = os.path.join(out_i, "manual_align.json")
+                cmd = ([sys.executable, "--align-tool", lidar, ply, mj]
+                       if getattr(sys, "frozen", False)
+                       else [sys.executable, os.path.abspath(__file__), "--align-tool", lidar, ply, mj])
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        text=True, bufsize=1)
+                self._proc = proc
+                for line in proc.stdout:
+                    self.q.put(("log", line))
+                    if self._cancel.is_set():
+                        _kill_tree(proc); break
+                proc.wait(); self._proc = None
+                if os.path.isfile(mj):
+                    ckw["manual_align"] = mj
+                    refine(**ckw); done += 1
+                else:
+                    self.q.put(("log", f"[component {i+1}] skipped (no placement)\n"))
+            self.q.put(("log", f"\nDone: {done}/{len(comps)} component(s) aligned. XMP -> {xmp_out}\n"))
+            self.q.put(("done", 0))
         except Exception:
             self.q.put(("log", "\n" + traceback.format_exc()))
             self.q.put(("done", 1))

@@ -134,6 +134,47 @@ def _export_picking_ply(rec, path, cap=500_000):
     qa.write_ply(path, X[keep], np.full((len(keep), 3), 220, np.uint8))
 
 
+def discover_components(parent):
+    """Find the COLMAP model dirs under `parent` - one per RealityScan component. A model dir holds
+    cameras/images/points3D (.bin or .txt). If `parent` is itself a model, returns just [parent].
+    RS can split a hard scene into several components; this lets one run pick up all of them."""
+    parent = str(parent)
+
+    def is_model(d):
+        try:
+            f = set(os.listdir(d))
+        except OSError:
+            return False
+        return any({f"cameras.{e}", f"images.{e}", f"points3D.{e}"} <= f for e in ("bin", "txt"))
+
+    if is_model(parent):
+        return [parent]
+    found = []
+    for root, dirs, _files in os.walk(parent):
+        if is_model(root):
+            found.append(root)
+            dirs[:] = []          # a model dir has no model children; don't descend
+    return sorted(found)
+
+
+def component_placed(rec, scan_lo, scan_hi, margin_frac=0.4):
+    """True if this component already sits in the scan's coordinates (RS aligned it to the imported
+    scan) - then it just needs refining. False = unbound / arbitrary frame -> needs manual placement.
+    Heuristic: the model's median point falls inside the scan bbox (grown by margin_frac of its span)
+    AND its extent is within ~5x the scan's (an arbitrary-frame model is usually elsewhere or a wildly
+    different size)."""
+    P = np.array([p.xyz for p in rec.points3D.values()], np.float64)
+    if len(P) == 0:
+        return False
+    c = np.median(P, axis=0)
+    span = np.maximum(scan_hi - scan_lo, 1e-9)
+    m = span * margin_frac
+    inside = bool(np.all(c >= scan_lo - m) and np.all(c <= scan_hi + m))
+    mspan = np.percentile(P, 98, 0) - np.percentile(P, 2, 0)
+    ratio = float(np.median(np.maximum(mspan, 1e-9) / span))
+    return inside and (0.2 < ratio < 5.0)
+
+
 def _native_plane_cost(plane_pt, plane_n, weight, soft=100.0):
     """Point-to-plane as a NATIVE (C++) NormalPrior cost so the bundle adjust can MULTI-THREAD.
 
